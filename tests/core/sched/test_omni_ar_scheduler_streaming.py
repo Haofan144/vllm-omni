@@ -19,6 +19,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.memory_coordinator import (
+    BudgetAllocator,
+    DynamicHBMConfig,
+    RankMemoryReport,
+    ReplicaMemoryReport,
+)
 
 # isort: on
 
@@ -59,6 +65,105 @@ def test_hbm_budget_waiting_admission_guard(enabled, free_blocks, expected):
     )
 
     assert sched._should_defer_waiting_admission() is expected
+
+
+def test_dynamic_hbm_updates_effective_admission_cap() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    config = DynamicHBMConfig(enabled=True, sample_interval_ms=1)
+    sched._dynamic_hbm_config = config
+    sched._dynamic_hbm_allocator = BudgetAllocator(config, 16)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
+    sched._effective_max_num_seqs = 16
+    report = ReplicaMemoryReport(
+        stage_id=0,
+        replica_id=0,
+        timestamp_monotonic_s=10.0,
+        rank_reports=(
+            RankMemoryReport(
+                stage_id=0,
+                replica_id=0,
+                rank=0,
+                device_id=0,
+                timestamp_monotonic_s=10.0,
+                device_total_bytes=1000,
+                device_free_bytes=90,
+                process_allocated_bytes=100,
+                process_reserved_bytes=120,
+            ),
+        ),
+        expected_rank_count=1,
+        kv_total_blocks=100,
+        kv_free_blocks=50,
+        running_requests=0,
+        waiting_requests=4,
+        configured_max_num_seqs=16,
+    )
+
+    sched.update_replica_memory_report(report)
+
+    assert sched._effective_max_num_seqs == 8
+
+
+def test_dynamic_admission_cap_never_evicts_running_requests() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.max_num_running_reqs = 16
+    sched._effective_max_num_seqs = 4
+    sched.running = [object()] * 6
+    sched.num_waiting_for_streaming_input = 1
+
+    assert sched._dynamic_max_num_running_reqs() == 7
+
+
+def test_central_budget_decision_rejects_stale_generation() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._configured_max_num_seqs = 16
+    sched._effective_max_num_seqs = 16
+    sched._last_budget_generation = 0
+    sched._dynamic_hbm_config = DynamicHBMConfig(enabled=True, min_num_seqs=2)
+
+    assert sched.apply_stage_budget_decision(
+        generation=2,
+        effective_max_num_seqs=8,
+        pressure=0.91,
+        reason="shared_device_high_pressure",
+    )
+    assert sched._effective_max_num_seqs == 8
+    assert not sched.apply_stage_budget_decision(
+        generation=1,
+        effective_max_num_seqs=16,
+        pressure=0.5,
+        reason="stale",
+    )
+    assert sched._effective_max_num_seqs == 8
+
+
+def test_central_budget_scales_token_budget_and_rejects_stale_report() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._configured_max_num_seqs = 16
+    sched._configured_max_num_scheduled_tokens = 4096
+    sched._effective_max_num_seqs = 16
+    sched._effective_max_num_scheduled_tokens = 4096
+    sched._last_budget_generation = 0
+    sched._last_budget_report_generation = 0
+    sched._dynamic_hbm_config = DynamicHBMConfig(enabled=True, min_num_seqs=2)
+
+    assert sched.apply_stage_budget_decision(
+        generation=1,
+        based_on_report_generation=5,
+        effective_max_num_seqs=4,
+        pressure=0.96,
+        reason="critical_pressure",
+    )
+    assert sched._effective_max_num_scheduled_tokens == 1024
+    assert sched._dynamic_hbm_critical
+    assert not sched.apply_stage_budget_decision(
+        generation=2,
+        based_on_report_generation=4,
+        effective_max_num_seqs=16,
+        pressure=0.5,
+        reason="stale_report",
+    )
+    assert sched._effective_max_num_seqs == 4
 
 
 def _make_request() -> Request:

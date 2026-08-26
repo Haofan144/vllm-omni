@@ -192,6 +192,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
     enable_chunked_prefill: bool
     async_scheduling: bool
     hbm_admission_guard: bool
+    dynamic_hbm: dict[str, Any]
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
@@ -457,6 +458,7 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = None
     hbm_admission_guard: bool | None = None
+    dynamic_hbm: dict[str, Any] | None = None
 
     def __post_init__(self, is_encoder_decoder: bool = False) -> None:
         # Upstream initializes these derived fields in its terminal post-init.
@@ -464,6 +466,11 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens
 
+        from vllm_omni.core.memory_coordinator import DynamicHBMConfig
+
+        dynamic_hbm = DynamicHBMConfig.from_value(self.dynamic_hbm)
+        if self.max_num_seqs is not None and dynamic_hbm.min_num_seqs > self.max_num_seqs:
+            raise ValueError("dynamic_hbm.min_num_seqs must not exceed max_num_seqs")
         if (
             self.max_num_batched_tokens is not None
             and self.max_num_seqs is not None

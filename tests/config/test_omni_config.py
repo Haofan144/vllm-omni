@@ -95,6 +95,52 @@ def test_stage_hbm_limit_projects_to_legacy_and_structured_configs():
     )
 
 
+def test_dynamic_hbm_projects_to_legacy_and_structured_configs():
+    dynamic_hbm = {
+        "enabled": True,
+        "min_num_seqs": 2,
+        "low_watermark": 0.70,
+        "high_watermark": 0.85,
+        "critical_watermark": 0.95,
+    }
+    pipeline = PipelineConfig(
+        model_type="dynamic-hbm-test",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="thinker"),),
+    )
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, max_num_seqs=16, dynamic_hbm=dynamic_hbm)],
+    )
+
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    structured_stage = structured.stage_by_id(0)
+
+    assert legacy[0].yaml_engine_args["dynamic_hbm"] == dynamic_hbm
+    assert structured_stage.scheduler_config.dynamic_hbm == dynamic_hbm
+    assert (
+        build_engine_args_dict_from_omni_stage_config(
+            structured_stage,
+            model="/tmp/dynamic-hbm-test-model",
+        )["dynamic_hbm"]
+        == dynamic_hbm
+    )
+
+
+def test_stage_dynamic_hbm_rejects_invalid_config():
+    with pytest.raises(ValueError, match="dynamic_hbm"):
+        StageDeployConfig(
+            stage_id=0,
+            dynamic_hbm={"low_watermark": 0.9, "high_watermark": 0.8},
+        )
+
+    with pytest.raises(ValueError, match="must not exceed max_num_seqs"):
+        StageDeployConfig(
+            stage_id=0,
+            max_num_seqs=2,
+            dynamic_hbm={"min_num_seqs": 3},
+        )
+
+
 def test_hbm_limit_becomes_hard_kv_cache_byte_limit():
     gib = 1024**3
 
@@ -675,6 +721,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {f.name for f in fields(VllmSchedulerConfig)} | {
         "max_model_len",
         "hbm_admission_guard",
+        "dynamic_hbm",
     }
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "async_chunk",

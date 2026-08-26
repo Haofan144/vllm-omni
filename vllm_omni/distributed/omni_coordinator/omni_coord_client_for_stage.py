@@ -6,12 +6,13 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict
 
 import zmq
 
-from .messages import ReplicaEvent, ReplicaStatus
+from .messages import BudgetDecisionEvent, ReplicaEvent, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,17 @@ class OmniCoordClientForStage:
         input_addr: str,
         output_addr: str,
         stage_id: int,
+        replica_id: int = 0,
+        instance_id: str | None = None,
     ) -> None:
         """Initialize client and send initial registration / status-up event."""
         self._coord_zmq_addr = coord_zmq_addr
         self._input_addr = input_addr
         self._output_addr = output_addr
         self._stage_id = stage_id
+        self._replica_id = replica_id
+        self._instance_id = instance_id or uuid.uuid4().hex
+        self._report_generation = 0
 
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
@@ -92,6 +98,20 @@ class OmniCoordClientForStage:
                     self._ctx = zmq.Context()
                     self._socket = self._ctx.socket(zmq.DEALER)
                     self._socket.connect(self._coord_zmq_addr)
+                    # A ROUTER forgets the logical route when the old DEALER
+                    # disappears. Re-register the new socket identity before
+                    # retrying the event that triggered this reconnect.
+                    registration = ReplicaEvent(
+                        input_addr=self._input_addr,
+                        output_addr=self._output_addr,
+                        stage_id=self._stage_id,
+                        event_type="update",
+                        status=self._status,
+                        queue_length=self._queue_length,
+                        replica_id=self._replica_id,
+                        instance_id=self._instance_id,
+                    )
+                    self._socket.send(json.dumps(asdict(registration)).encode("utf-8"))
                     return True
                 except zmq.ZMQError as e:
                     logger.error(
@@ -130,6 +150,8 @@ class OmniCoordClientForStage:
                 event_type=event_type,
                 status=self._status,
                 queue_length=self._queue_length,
+                replica_id=self._replica_id,
+                instance_id=self._instance_id,
             )
             data = json.dumps(asdict(event)).encode("utf-8")
 
@@ -176,6 +198,43 @@ class OmniCoordClientForStage:
                 self._queue_length = queue_length
 
             self._send_event("update")
+
+    def send_memory_report(self, report: dict, dynamic_hbm: dict) -> int:
+        """Send one report and return its monotonically increasing generation."""
+        with self._send_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("Client is closing or already closed")
+            self._report_generation += 1
+            payload = {
+                "message_type": "memory_report",
+                "input_addr": self._input_addr,
+                "stage_id": self._stage_id,
+                "replica_id": self._replica_id,
+                "instance_id": self._instance_id,
+                "report_generation": self._report_generation,
+                "report": report,
+                "dynamic_hbm": dynamic_hbm,
+            }
+            self._socket.send(json.dumps(payload).encode("utf-8"), flags=zmq.NOBLOCK)
+            return self._report_generation
+
+    def poll_budget_decisions(self) -> list[BudgetDecisionEvent]:
+        """Non-blockingly drain decisions; caller applies them on EngineCore's thread."""
+        decisions: list[BudgetDecisionEvent] = []
+        with self._send_lock:
+            while not self._closed:
+                try:
+                    raw = self._socket.recv(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                data = json.loads(raw.decode("utf-8"))
+                if data.get("message_type") != "budget_decision":
+                    continue
+                try:
+                    decisions.append(BudgetDecisionEvent(**data))
+                except (TypeError, ValueError):
+                    logger.warning("Dropping malformed budget decision: %r", data)
+        return decisions
 
     def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat events while the client is alive."""
@@ -238,6 +297,7 @@ def create_stage_coord_client(
     input_addr: str,
     output_addr: str,
     stage_id: int,
+    replica_id: int = 0,
     queue_length_getter: Callable[[], int] | None = None,
 ) -> OmniCoordClientForStage:
     """Create a stage coordinator client with an optional heartbeat hook."""
@@ -246,6 +306,7 @@ def create_stage_coord_client(
         input_addr=input_addr,
         output_addr=output_addr,
         stage_id=stage_id,
+        replica_id=replica_id,
     )
     if queue_length_getter is not None:
 

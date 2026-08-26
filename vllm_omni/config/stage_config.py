@@ -321,6 +321,8 @@ class StageDeployConfig:
     # the native KV allocator under the same hard cache budget. ``None`` means
     # enable the guard whenever hbm_limit_gb is configured.
     hbm_admission_guard: bool | None = None
+    # Optional per-rank HBM reporting and per-replica dynamic admission control.
+    dynamic_hbm: dict[str, Any] | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
@@ -413,8 +415,13 @@ class StageDeployConfig:
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        from vllm_omni.core.memory_coordinator import DynamicHBMConfig
+
         if self.hbm_admission_guard is not None and not isinstance(self.hbm_admission_guard, bool):
             raise ValueError(f"hbm_admission_guard must be a boolean or null, got {self.hbm_admission_guard!r}")
+        dynamic_hbm = DynamicHBMConfig.from_value(self.dynamic_hbm)
+        if self.max_num_seqs is not None and dynamic_hbm.min_num_seqs > self.max_num_seqs:
+            raise ValueError("dynamic_hbm.min_num_seqs must not exceed max_num_seqs")
         if self.hbm_limit_gb is None:
             return
         if (

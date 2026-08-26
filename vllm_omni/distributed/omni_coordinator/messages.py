@@ -29,6 +29,36 @@ class ReplicaEvent:
     event_type: str  # "update" | "heartbeat"
     status: ReplicaStatus  # Current status
     queue_length: int  # Current queue length
+    replica_id: int = 0
+    instance_id: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryReportEvent:
+    """Stage replica memory report sent to the central coordinator."""
+
+    input_addr: str
+    stage_id: int
+    replica_id: int
+    instance_id: str
+    report_generation: int
+    report: dict
+    dynamic_hbm: dict
+
+
+@dataclass(frozen=True)
+class BudgetDecisionEvent:
+    """Coordinator decision delivered to exactly one stage replica."""
+
+    message_type: str
+    stage_id: int
+    replica_id: int
+    instance_id: str
+    decision_generation: int
+    based_on_report_generation: int
+    effective_max_num_seqs: int
+    pressure: float
+    reason: str
 
 
 @dataclass
@@ -46,6 +76,8 @@ class ReplicaInfo:
     queue_length: int  # Current queue length of this replica
     last_heartbeat: float  # Timestamp of the last heartbeat received (seconds)
     registered_at: float  # Timestamp when the replica was registered (seconds)
+    replica_id: int = 0
+    instance_id: str = ""
 
 
 @dataclass

@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import gc
 import os
+import socket
 import time
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import asdict
 
 import torch
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
+from vllm_omni.core.memory_coordinator import RankMemoryReporter
 from vllm_omni.diffusion.data import (
     OmniACK,
     OmniSleepTask,
@@ -44,6 +47,29 @@ class OmniGPUWorkerBase(GPUWorker):
             current_omni_platform.synchronize()
             gc.collect()
             return res
+
+    def report_rank_memory(self) -> dict[str, int | float]:
+        """Return a serializable memory snapshot for this worker's GPU rank."""
+        reporter = getattr(self, "_rank_memory_reporter", None)
+        if reporter is None:
+            device_id = self.device.index
+            if device_id is None:
+                device_id = self.local_rank
+            reporter = RankMemoryReporter(
+                stage_id=getattr(self.vllm_config.model_config, "stage_id", 0),
+                replica_id=int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0")),
+                rank=self.rank,
+                device_id=device_id,
+                device_memory_provider=lambda: torch.cuda.mem_get_info(self.device),
+                process_memory_provider=lambda: (
+                    torch.cuda.memory_allocated(self.device),
+                    torch.cuda.memory_reserved(self.device),
+                ),
+                node_id=socket.gethostname(),
+                device_uuid=str(getattr(torch.cuda.get_device_properties(self.device), "uuid", "")),
+            )
+            self._rank_memory_reporter = reporter
+        return asdict(reporter.report())
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

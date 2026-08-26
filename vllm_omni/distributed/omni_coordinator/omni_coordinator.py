@@ -11,6 +11,13 @@ from typing import Any
 
 import zmq
 
+from vllm_omni.core.memory_coordinator import (
+    BudgetAllocator,
+    DynamicHBMConfig,
+    RankMemoryReport,
+    ReplicaMemoryReport,
+)
+
 from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
 
 logger = logging.getLogger(__name__)
@@ -59,6 +66,17 @@ class OmniCoordinator:
         self.pub_zmq_addr = self._pub.getsockopt_string(zmq.LAST_ENDPOINT)
 
         self._replicas: dict[str, ReplicaInfo] = {}
+        self._stage_routes: dict[str, bytes] = {}
+        self._memory_reports: dict[str, ReplicaMemoryReport] = {}
+        self._memory_instances: dict[str, str] = {}
+        self._memory_report_generations: dict[str, int] = {}
+        self._budget_generations: dict[str, int] = {}
+        self._budget_allocators: dict[str, BudgetAllocator] = {}
+        self._last_caps: dict[str, int] = {}
+        self._memory_configs: dict[str, DynamicHBMConfig] = {}
+        self._memory_received_at: dict[str, float] = {}
+        self._last_allocation_at: dict[str, float] = {}
+        self._last_pressures: dict[str, float] = {}
         self._lock = threading.Lock()
         self._pub_lock = threading.Lock()
 
@@ -140,6 +158,19 @@ class OmniCoordinator:
         """Mark replica as ERROR (e.g. after heartbeat timeout)."""
         info.status = ReplicaStatus.ERROR
 
+    def _clear_memory_state(self, input_addr: str) -> None:
+        self._stage_routes.pop(input_addr, None)
+        self._memory_reports.pop(input_addr, None)
+        self._memory_instances.pop(input_addr, None)
+        self._memory_report_generations.pop(input_addr, None)
+        self._budget_generations.pop(input_addr, None)
+        self._budget_allocators.pop(input_addr, None)
+        self._last_caps.pop(input_addr, None)
+        self._memory_configs.pop(input_addr, None)
+        self._memory_received_at.pop(input_addr, None)
+        self._last_allocation_at.pop(input_addr, None)
+        self._last_pressures.pop(input_addr, None)
+
     def _check_heartbeat_timeouts(self) -> None:
         """Mark replicas as ERROR if their heartbeat has timed out."""
         now = time()
@@ -152,6 +183,7 @@ class OmniCoordinator:
             for input_addr, info in self._replicas.items():
                 if info.status == ReplicaStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
                     self._mark_replica_error_locked(info)
+                    self._clear_memory_state(input_addr)
                     timed_out = True
                 elif info.status in (ReplicaStatus.DOWN, ReplicaStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
                     to_delete.append(input_addr)
@@ -209,6 +241,8 @@ class OmniCoordinator:
                 event_type=str(data["event_type"]),
                 status=ReplicaStatus(data.get("status")),
                 queue_length=data.get("queue_length"),
+                replica_id=int(data.get("replica_id", 0)),
+                instance_id=str(data.get("instance_id", "")),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -219,6 +253,7 @@ class OmniCoordinator:
             try:
                 frames = self._router.recv_multipart()
             except zmq.Again:
+                self._check_memory_report_timeouts()
                 # RCVTIMEO expired, loop to recheck _running.
                 continue
             except zmq.ZMQError:
@@ -228,18 +263,191 @@ class OmniCoordinator:
             if not frames:
                 continue
 
+            routing_identity = frames[0]
             payload = frames[-1]
             try:
                 data = json.loads(payload.decode("utf-8"))
-                event = self._parse_replica_event(data)
             except json.JSONDecodeError as e:
                 logger.warning("Invalid JSON in replica event, dropping: %s", e)
                 continue
+            if data.get("message_type") == "memory_report":
+                self._handle_memory_report(data, routing_identity)
+                continue
+
+            event = self._parse_replica_event(data)
             if event is None:
                 logger.warning("Malformed replica event, dropping")
                 continue
 
+            self._stage_routes[event.input_addr] = routing_identity
             self._handle_event(event)
+
+    @staticmethod
+    def _device_keys(report: ReplicaMemoryReport) -> set[tuple[str, str]]:
+        return {
+            (rank.node_id, rank.device_uuid or f"local-device-{rank.device_id}")
+            for rank in report.rank_reports
+        }
+
+    def _handle_memory_report(self, data: dict[str, Any], routing_identity: bytes) -> None:
+        """Update the central view and send decisions for all shared-device consumers."""
+        with self._lock:
+            self._handle_memory_report_locked(data, routing_identity)
+
+    def _handle_memory_report_locked(self, data: dict[str, Any], routing_identity: bytes) -> None:
+        try:
+            input_addr = str(data["input_addr"])
+            instance_id = str(data["instance_id"])
+            report_generation = int(data["report_generation"])
+            raw_report = dict(data["report"])
+            raw_report["rank_reports"] = tuple(
+                RankMemoryReport(**rank) for rank in raw_report.get("rank_reports", ())
+            )
+            report = ReplicaMemoryReport(**raw_report)
+            config = DynamicHBMConfig.from_value(data.get("dynamic_hbm"))
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Dropping malformed memory report: %s", exc)
+            return
+        if not config.enabled:
+            return
+
+        registered = self._replicas.get(input_addr)
+        if registered is not None and (
+            registered.stage_id != report.stage_id
+            or registered.replica_id != report.replica_id
+            or (registered.instance_id and registered.instance_id != instance_id)
+        ):
+            logger.warning("Dropping memory report whose identity does not match registration: %s", input_addr)
+            return
+
+        previous_instance = self._memory_instances.get(input_addr)
+        if previous_instance != instance_id:
+            self._memory_report_generations[input_addr] = 0
+            self._budget_generations[input_addr] = 0
+            self._budget_allocators.pop(input_addr, None)
+        if report_generation <= self._memory_report_generations.get(input_addr, 0):
+            return
+
+        self._stage_routes[input_addr] = routing_identity
+        self._memory_instances[input_addr] = instance_id
+        self._memory_report_generations[input_addr] = report_generation
+        self._memory_reports[input_addr] = report
+        self._memory_configs[input_addr] = config
+        self._memory_received_at[input_addr] = time()
+        self._budget_allocators.setdefault(
+            input_addr,
+            BudgetAllocator(config, report.configured_max_num_seqs),
+        )
+        if report_generation == 1:
+            logger.info(
+                "[HBMCoordinator] registered memory stream stage=%d replica=%d devices=%s",
+                report.stage_id,
+                report.replica_id,
+                sorted(self._device_keys(report)),
+            )
+
+        incoming_devices = self._device_keys(report)
+        affected = [
+            addr
+            for addr, candidate in self._memory_reports.items()
+            if incoming_devices & self._device_keys(candidate)
+        ]
+        # Device HBM is shared; KV blocks are private to a stage replica and
+        # must not throttle unrelated consumers on the same physical GPU.
+        shared_hbm_pressure = max(self._memory_reports[addr].hbm_pressure for addr in affected)
+        for addr in affected:
+            candidate = self._memory_reports[addr]
+            allocator = self._budget_allocators.get(addr)
+            route = self._stage_routes.get(addr)
+            if allocator is None or route is None:
+                continue
+            effective_pressure = max(shared_hbm_pressure, candidate.kv_pressure)
+            now = time()
+            candidate_config = self._memory_configs[addr]
+            due = now - self._last_allocation_at.get(addr, 0.0) >= candidate_config.sample_interval_ms / 1000
+            pressure_crossing = (
+                effective_pressure >= candidate_config.high_watermark
+                and self._last_pressures.get(addr, 0.0) < candidate_config.high_watermark
+            )
+            if not due and not pressure_crossing:
+                continue
+            decision = allocator.allocate(candidate, pressure_override=effective_pressure)
+            self._last_allocation_at[addr] = now
+            self._last_pressures[addr] = effective_pressure
+            # Every emitted decision gets a generation. Pressure state can
+            # change while the cap remains at its minimum; consumers still
+            # need that update to leave critical admission mode.
+            generation = self._budget_generations.get(addr, 0) + 1
+            self._budget_generations[addr] = generation
+            self._last_caps[addr] = decision.effective_max_num_seqs
+            wire = {
+                "message_type": "budget_decision",
+                "stage_id": candidate.stage_id,
+                "replica_id": candidate.replica_id,
+                "instance_id": self._memory_instances[addr],
+                "decision_generation": generation,
+                "based_on_report_generation": self._memory_report_generations[addr],
+                "effective_max_num_seqs": decision.effective_max_num_seqs,
+                "pressure": effective_pressure,
+                "reason": decision.reason if len(affected) == 1 else f"shared_device_{decision.reason}",
+            }
+            try:
+                self._router.send_multipart([route, json.dumps(wire).encode("utf-8")], flags=zmq.NOBLOCK)
+            except (zmq.Again, zmq.ZMQError):
+                logger.warning("Dropping HBM budget decision for %s", addr)
+
+    def _check_memory_report_timeouts(self) -> None:
+        """Fail safe when a live replica stops publishing memory samples."""
+        with self._lock:
+            self._check_memory_report_timeouts_locked()
+
+    def _check_memory_report_timeouts_locked(self) -> None:
+        now = time()
+        for addr, received_at in list(self._memory_received_at.items()):
+            config = self._memory_configs.get(addr)
+            report = self._memory_reports.get(addr)
+            allocator = self._budget_allocators.get(addr)
+            route = self._stage_routes.get(addr)
+            if config is None or report is None or allocator is None or route is None:
+                continue
+            if now - received_at < config.report_timeout_ms / 1000:
+                continue
+            # Advance at most once per sample interval; an empty rank set uses
+            # BudgetAllocator's grace/decrease policy.
+            if now - self._last_allocation_at.get(addr, 0.0) < config.sample_interval_ms / 1000:
+                continue
+            stale = ReplicaMemoryReport(
+                stage_id=report.stage_id,
+                replica_id=report.replica_id,
+                timestamp_monotonic_s=report.timestamp_monotonic_s,
+                rank_reports=(),
+                expected_rank_count=report.expected_rank_count,
+                kv_total_blocks=report.kv_total_blocks,
+                kv_free_blocks=report.kv_free_blocks,
+                running_requests=report.running_requests,
+                waiting_requests=report.waiting_requests,
+                configured_max_num_seqs=report.configured_max_num_seqs,
+            )
+            decision = allocator.allocate(stale)
+            self._last_allocation_at[addr] = now
+            generation = self._budget_generations.get(addr, 0) + 1
+            self._budget_generations[addr] = generation
+            self._last_caps[addr] = decision.effective_max_num_seqs
+            wire = {
+                "message_type": "budget_decision",
+                "stage_id": report.stage_id,
+                "replica_id": report.replica_id,
+                "instance_id": self._memory_instances[addr],
+                "decision_generation": generation,
+                "based_on_report_generation": self._memory_report_generations[addr],
+                "effective_max_num_seqs": decision.effective_max_num_seqs,
+                "pressure": config.high_watermark,
+                "reason": f"stale_report_{decision.reason}",
+            }
+            try:
+                self._router.send_multipart([route, json.dumps(wire).encode("utf-8")], flags=zmq.NOBLOCK)
+            except (zmq.Again, zmq.ZMQError):
+                logger.warning("Dropping stale-report HBM decision for %s", addr)
 
     def _periodic_loop(self) -> None:
         """Periodic loop to check heartbeat timeouts and flush broadcasts.
@@ -347,6 +555,8 @@ class OmniCoordinator:
             queue_length=event.queue_length,
             last_heartbeat=now,
             registered_at=now,
+            replica_id=event.replica_id,
+            instance_id=event.instance_id,
         )
         self._replicas[input_addr] = info
 
@@ -359,6 +569,10 @@ class OmniCoordinator:
 
         if event.queue_length is not None:
             info.queue_length = event.queue_length
+        if event.instance_id and event.instance_id != info.instance_id:
+            self._clear_memory_state(input_addr)
+            info.instance_id = event.instance_id
+        info.replica_id = event.replica_id
 
     def _remove_replica_locked(self, event: ReplicaEvent) -> None:
         input_addr = event.input_addr
@@ -367,3 +581,4 @@ class OmniCoordinator:
             return
 
         info.status = ReplicaStatus.DOWN
+        self._clear_memory_state(input_addr)

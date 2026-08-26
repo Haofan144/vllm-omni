@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import time
+from dataclasses import asdict
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -28,6 +30,7 @@ from vllm.v1.engine.utils import (
     SignalCallback,
 )
 
+from vllm_omni.core.memory_coordinator import RankMemoryReport, ReplicaMemoryAggregator
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
@@ -60,6 +63,132 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
+
+    def _maybe_start_dynamic_hbm_report(self) -> None:
+        config = getattr(self.scheduler, "_dynamic_hbm_config", None)
+        if config is None or not config.enabled:
+            return
+        pending = getattr(self, "_dynamic_hbm_report_future", None)
+        if pending is not None:
+            return
+        now = time.monotonic()
+        last_sample = getattr(self, "_dynamic_hbm_last_sample_s", float("-inf"))
+        if now - last_sample < config.sample_interval_ms / 1000:
+            return
+        self._dynamic_hbm_last_sample_s = now
+        self._dynamic_hbm_report_started_s = now
+
+        try:
+            self._dynamic_hbm_report_future = self.model_executor.collective_rpc(
+                "report_rank_memory",
+                timeout=config.report_timeout_ms / 1000,
+                non_block=True,
+            )
+        except Exception:
+            logger.exception("[HBMCoordinator] failed to start replica rank memory report")
+
+    def _maybe_finish_dynamic_hbm_report(self) -> None:
+        future = getattr(self, "_dynamic_hbm_report_future", None)
+        if future is None:
+            return
+        config = self.scheduler._dynamic_hbm_config
+        timed_out = (
+            time.monotonic() - getattr(self, "_dynamic_hbm_report_started_s", time.monotonic())
+            >= config.report_timeout_ms / 1000
+        )
+        if not future.done() and not timed_out:
+            return
+        self._dynamic_hbm_report_future = None
+
+        parallel_config = self.vllm_config.parallel_config
+        expected_rank_count = parallel_config.tensor_parallel_size * parallel_config.pipeline_parallel_size
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
+        aggregator = getattr(self, "_dynamic_hbm_aggregator", None)
+        if aggregator is None:
+            aggregator = ReplicaMemoryAggregator(
+                stage_id=stage_id,
+                replica_id=replica_id,
+                expected_rank_count=expected_rank_count,
+            )
+            self._dynamic_hbm_aggregator = aggregator
+
+        rank_reports: list[RankMemoryReport] = []
+        try:
+            if not timed_out:
+                payloads = future.result()
+                rank_reports = [RankMemoryReport(**payload) for payload in payloads if payload is not None]
+            else:
+                future.cancel()
+                logger.warning("[HBMCoordinator] rank memory report timed out")
+        except Exception:
+            logger.exception("[HBMCoordinator] failed to finish replica rank memory report")
+
+        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        total_blocks = getattr(getattr(self.scheduler, "kv_cache_config", None), "num_blocks", None)
+        report = aggregator.aggregate(
+            rank_reports,
+            kv_total_blocks=total_blocks,
+            kv_free_blocks=free_blocks,
+            running_requests=len(self.scheduler.running),
+            waiting_requests=len(self.scheduler.waiting),
+            configured_max_num_seqs=self.scheduler._configured_max_num_seqs,
+        )
+        coord_client = getattr(self, "_dynamic_hbm_coord_client", None)
+        if coord_client is None:
+            # Standalone EngineCore remains backward compatible.
+            self.scheduler.update_replica_memory_report(report)
+            return
+        try:
+            generation = coord_client.send_memory_report(asdict(report), asdict(config))
+            if generation == 1:
+                logger.info(
+                    "[HBMCoordinator] stage=%d replica=%d first central memory report sent ranks=%d pressure=%.4f",
+                    report.stage_id,
+                    report.replica_id,
+                    len(report.rank_reports),
+                    report.pressure,
+                )
+        except Exception:
+            logger.exception("[HBMCoordinator] failed to send central memory report")
+
+    def _apply_dynamic_hbm_decisions(self) -> None:
+        client = getattr(self, "_dynamic_hbm_coord_client", None)
+        if client is None:
+            return
+        try:
+            decisions = client.poll_budget_decisions()
+        except Exception:
+            logger.exception("[HBMCoordinator] failed to receive central budget decisions")
+            return
+        for decision in decisions:
+            if decision.instance_id != client._instance_id:
+                continue
+            if decision.stage_id != client._stage_id or decision.replica_id != client._replica_id:
+                continue
+            self.scheduler.apply_stage_budget_decision(
+                generation=decision.decision_generation,
+                effective_max_num_seqs=decision.effective_max_num_seqs,
+                pressure=decision.pressure,
+                reason=decision.reason,
+                based_on_report_generation=decision.based_on_report_generation,
+            )
+
+    def step(self):
+        self._apply_dynamic_hbm_decisions()
+        self._maybe_finish_dynamic_hbm_report()
+        self._maybe_start_dynamic_hbm_report()
+        result = super().step()
+        self._maybe_finish_dynamic_hbm_report()
+        return result
+
+    def step_with_batch_queue(self):
+        self._apply_dynamic_hbm_decisions()
+        self._maybe_finish_dynamic_hbm_report()
+        self._maybe_start_dynamic_hbm_report()
+        result = super().step_with_batch_queue()
+        self._maybe_finish_dynamic_hbm_report()
+        return result
 
     @staticmethod
     def run_stage_core(
@@ -165,8 +294,10 @@ class StageEngineCoreProc(EngineCoreProc):
                     input_addr=addresses.inputs[0],
                     output_addr=addresses.outputs[0],
                     stage_id=int(omni_stage_id),
+                    replica_id=max(int(omni_replica_id), 0),
                     queue_length_getter=scheduler.get_num_unfinished_requests,
                 )
+                engine_core._dynamic_hbm_coord_client = coord_client
 
             def wakeup_engine() -> None:
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))

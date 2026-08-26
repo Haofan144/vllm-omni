@@ -4,11 +4,13 @@
 import json
 import threading
 import time
+from dataclasses import asdict
 
 import pytest
 import zmq
 from vllm.v1.utils import get_engine_client_zmq_addr
 
+from vllm_omni.core.memory_coordinator import RankMemoryReport, ReplicaMemoryReport
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
     OmniCoordinator,
@@ -47,6 +49,77 @@ def _drain_sub_messages(sub: zmq.Socket, max_seconds: float = 0.4) -> None:
     deadline = time.time() + max_seconds
     while time.time() < deadline:
         _recv_replica_list(sub, timeout_ms=50)
+
+
+def _memory_report(stage_id: int, replica_id: int, pressure: float) -> dict:
+    rank = RankMemoryReport(
+        stage_id=stage_id,
+        replica_id=replica_id,
+        rank=0,
+        device_id=0,
+        timestamp_monotonic_s=time.monotonic(),
+        device_total_bytes=1000,
+        device_free_bytes=round(1000 * (1 - pressure)),
+        process_allocated_bytes=100,
+        process_reserved_bytes=120,
+        node_id="shared-node",
+        device_uuid="GPU-shared",
+    )
+    return asdict(
+        ReplicaMemoryReport(
+            stage_id=stage_id,
+            replica_id=replica_id,
+            timestamp_monotonic_s=rank.timestamp_monotonic_s,
+            rank_reports=(rank,),
+            expected_rank_count=1,
+            kv_total_blocks=100,
+            kv_free_blocks=50,
+            running_requests=0,
+            waiting_requests=4,
+            configured_max_num_seqs=16,
+        )
+    )
+
+
+def test_central_hbm_coordinator_updates_all_shared_gpu_consumers():
+    router_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
+    pub_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
+    coordinator = OmniCoordinator(router_addr, pub_addr, heartbeat_timeout=1000.0)
+    first = OmniCoordClientForStage(
+        coordinator.router_zmq_addr,
+        "tcp://stage:hbm-0",
+        "tcp://stage:hbm-0-out",
+        0,
+        replica_id=0,
+    )
+    second = OmniCoordClientForStage(
+        coordinator.router_zmq_addr,
+        "tcp://stage:hbm-1",
+        "tcp://stage:hbm-1-out",
+        1,
+        replica_id=0,
+    )
+    config = {"enabled": True, "sample_interval_ms": 1, "report_timeout_ms": 1000}
+    first.send_memory_report(_memory_report(0, 0, 0.5), config)
+    second.send_memory_report(_memory_report(1, 0, 0.92), config)
+
+    deadline = time.time() + 2
+    first_decisions = []
+    second_decisions = []
+    while time.time() < deadline:
+        first_decisions.extend(first.poll_budget_decisions())
+        second_decisions.extend(second.poll_budget_decisions())
+        if first_decisions and second_decisions and first_decisions[-1].effective_max_num_seqs == 8:
+            break
+        time.sleep(0.01)
+
+    assert first_decisions[-1].effective_max_num_seqs == 8
+    assert second_decisions[-1].effective_max_num_seqs == 8
+    assert first_decisions[-1].reason.startswith("shared_device_")
+
+    first.close()
+    second.close()
+    coordinator.close()
 
 
 def test_omni_coordinator_wait_for_shutdown_unblocks_on_close():

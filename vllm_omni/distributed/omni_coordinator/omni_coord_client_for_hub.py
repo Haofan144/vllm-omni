@@ -55,6 +55,8 @@ class OmniCoordClientForHub:
                     queue_length=int(rep["queue_length"]),
                     last_heartbeat=float(rep["last_heartbeat"]),
                     registered_at=float(rep["registered_at"]),
+                    replica_id=int(rep.get("replica_id", 0)),
+                    instance_id=str(rep.get("instance_id", "")),
                 )
             )
 

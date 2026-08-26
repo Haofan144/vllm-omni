@@ -147,6 +147,7 @@ class OmniModelConfig(ModelConfig):
     # capacity is carried by CacheConfig.kv_cache_memory_bytes.
     hbm_limit_gb: float | None = None
     hbm_admission_guard: bool | None = None
+    dynamic_hbm: dict[str, Any] | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False

@@ -1,0 +1,88 @@
+# Example matrix. Copy this file and replace the model/deploy/command fields
+# for another model. Paths are resolved relative to this file.
+model: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+deploy_config: ../../../vllm_omni/deploy/qwen3_tts.yaml
+request_profile: qwen3-tts
+dataset_path: ../../build_dataset/seed_tts_smoke
+repeats: 5
+arms:
+  - A_dynamic_off_no_pressure
+  - B_dynamic_on_no_pressure
+  - C_dynamic_off_pressure
+  - D_dynamic_on_pressure
+dynamic_stage_ids: [0, 1]
+
+metric_map:
+  throughput: request_throughput
+  p99_latency_ms: p99_e2el_ms
+  p99_first_output_ms: p99_audio_ttfp_ms
+
+runner_options:
+  max_num_seqs: 32
+  min_num_seqs: 2
+  include_fixed_cap: 8
+  startup_timeout: 1800
+  benchmark_timeout: 3600
+
+workloads:
+  - name: low
+    concurrency: 8
+    num_prompts: 400
+  - name: medium
+    concurrency: 22
+    num_prompts: 600
+  - name: saturation
+    concurrency: 32
+    num_prompts: 1000
+
+pressure_profiles:
+  - name: gradual
+    options:
+      pressure_baseline_seconds: 30
+      pressure_high_target: 0.84
+      pressure_high_seconds: 60
+      pressure_critical_target: 0.92
+      pressure_critical_seconds: 30
+      pressure_recovery_target: 0.68
+      pressure_recovery_seconds: 30
+      pressure_post_release_seconds: 60
+      pressure_chunk_mib: 64
+  - name: spike
+    options:
+      pressure_baseline_seconds: 30
+      pressure_high_target: 0.89
+      pressure_high_seconds: 1
+      pressure_critical_target: 0.94
+      pressure_critical_seconds: 60
+      pressure_recovery_target: 0.68
+      pressure_recovery_seconds: 30
+      pressure_post_release_seconds: 60
+      pressure_chunk_mib: 512
+
+controllers:
+  - name: default
+    options:
+      sample_interval_ms: 500
+      report_timeout_ms: 1500
+      low_watermark: 0.75
+      high_watermark: 0.90
+      critical_watermark: 0.95
+      scale_down_ratio: 0.5
+      scale_up_step: 1
+      scale_up_stable_samples: 5
+
+# For a different endpoint/model, set request_profile: custom and provide an
+# argv template. Supported placeholders are documented by the base runner.
+# benchmark_command:
+#   - python
+#   - /path/to/load_generator.py
+#   - --url
+#   - http://{host}:{port}
+#   - --model
+#   - "{model}"
+#   - --concurrency
+#   - "{concurrency}"
+#   - --requests
+#   - "{num_prompts}"
+#   - --output
+#   - "{result_json}"
