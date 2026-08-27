@@ -176,6 +176,100 @@ def _make_stage_runtime() -> StageRuntime:
     )
 
 
+def test_stage_runtime_starts_one_local_coordinator_when_any_stage_enables_dynamic_hbm(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    disabled_plan = _make_llm_plan(0, stage_id=0, vllm_config=object())
+    enabled_plan = _make_llm_plan(1, stage_id=1, vllm_config=object(), num_replicas=2)
+    disabled_plan.replicas[0].engine_args_dict = {
+        "dynamic_hbm": {"enabled": False},
+    }
+    for replica in enabled_plan.replicas:
+        replica.engine_args_dict = {"dynamic_hbm": {"enabled": True}}
+
+    events: list[str] = []
+    constructor_calls: list[dict[str, object]] = []
+
+    class _FakeCoordinatorRuntime:
+        router_address = "tcp://127.0.0.1:26000"
+
+        def close(self):
+            events.append("coordinator")
+
+    def _create_coordinator(**kwargs):
+        constructor_calls.append(kwargs)
+        return _FakeCoordinatorRuntime()
+
+    monkeypatch.setattr(runtime_mod, "OmniCoordinatorRuntime", _create_coordinator)
+
+    runtime._before_initialize_stage_replicas([disabled_plan, enabled_plan])
+    runtime._before_initialize_stage_replicas([disabled_plan, enabled_plan])
+
+    assert constructor_calls == [{"host": "127.0.0.1", "heartbeat_timeout": 30.0}]
+    assert runtime._get_coordinator_address() == "tcp://127.0.0.1:26000"
+
+    runtime.stage_pools = [
+        types.SimpleNamespace(
+            clients=[types.SimpleNamespace(shutdown=lambda: events.append("client"))],
+        )
+    ]
+    runtime.shutdown()
+
+    assert events == ["client", "coordinator"]
+    assert runtime._get_coordinator_address() is None
+
+
+def test_stage_runtime_does_not_start_local_coordinator_when_dynamic_hbm_is_disabled(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=object())
+    stage_plan.replicas[0].engine_args_dict = {
+        "dynamic_hbm": {"enabled": False},
+    }
+
+    def _unexpected_coordinator(**_kwargs):
+        raise AssertionError("disabled dynamic_hbm must not start a coordinator")
+
+    monkeypatch.setattr(runtime_mod, "OmniCoordinatorRuntime", _unexpected_coordinator)
+
+    runtime._before_initialize_stage_replicas([stage_plan])
+
+    assert runtime._get_coordinator_address() is None
+
+
+def test_stage_runtime_closes_local_coordinator_when_replica_initialization_fails(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=object())
+    stage_plan.replicas[0].engine_args_dict = {
+        "dynamic_hbm": {"enabled": True},
+    }
+    close_calls: list[None] = []
+
+    class _FakeCoordinatorRuntime:
+        router_address = "tcp://127.0.0.1:26000"
+
+        def close(self):
+            close_calls.append(None)
+
+    monkeypatch.setattr(runtime_mod, "OmniCoordinatorRuntime", lambda **_: _FakeCoordinatorRuntime())
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
+
+    def _fail_replica_initialization(*_args):
+        raise RuntimeError("replica launch failed")
+
+    monkeypatch.setattr(runtime, "_initialize_stage_replicas", _fail_replica_initialization)
+
+    with pytest.raises(RuntimeError, match="replica launch failed"):
+        runtime.initialize()
+
+    assert close_calls == [None]
+    assert runtime._get_coordinator_address() is None
+
+
 def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
     import vllm_omni.engine.stage_engine_core_client as client_mod
@@ -737,6 +831,7 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     @contextlib.contextmanager
     def _capture_launch_stage_replica(**kwargs):
         captured["log_stats"] = kwargs["log_stats"]
+        captured["omni_coordinator_address"] = kwargs["omni_coordinator_address"]
         yield resources
 
     monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
@@ -747,10 +842,14 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
         return stage_client
 
     monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _make_async_mp_client)
+    runtime._local_hbm_coordinator_runtime = types.SimpleNamespace(
+        router_address="tcp://127.0.0.1:26000",
+    )
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
     assert captured["log_stats"] is True
     assert captured["client_log_stats"] is True
+    assert captured["omni_coordinator_address"] == "tcp://127.0.0.1:26000"
 
 
 def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):

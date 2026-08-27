@@ -81,6 +81,23 @@ def _memory_report(stage_id: int, replica_id: int, pressure: float) -> dict:
     )
 
 
+def _empty_memory_report(stage_id: int, replica_id: int) -> dict:
+    return asdict(
+        ReplicaMemoryReport(
+            stage_id=stage_id,
+            replica_id=replica_id,
+            timestamp_monotonic_s=time.monotonic(),
+            rank_reports=(),
+            expected_rank_count=1,
+            kv_total_blocks=100,
+            kv_free_blocks=50,
+            running_requests=0,
+            waiting_requests=4,
+            configured_max_num_seqs=16,
+        )
+    )
+
+
 def test_central_hbm_coordinator_updates_all_shared_gpu_consumers():
     router_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
     pub_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
@@ -119,6 +136,37 @@ def test_central_hbm_coordinator_updates_all_shared_gpu_consumers():
 
     first.close()
     second.close()
+    coordinator.close()
+
+
+def test_central_hbm_coordinator_drops_empty_rank_telemetry_without_crashing():
+    router_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
+    pub_addr = get_engine_client_zmq_addr(local_only=False, host="127.0.0.1", port=0)
+    coordinator = OmniCoordinator(router_addr, pub_addr, heartbeat_timeout=1000.0)
+    client = OmniCoordClientForStage(
+        coordinator.router_zmq_addr,
+        "tcp://stage:empty-ranks",
+        "tcp://stage:empty-ranks-out",
+        0,
+        replica_id=0,
+    )
+    config = {"enabled": True, "sample_interval_ms": 1, "report_timeout_ms": 1000}
+
+    client.send_memory_report(_empty_memory_report(0, 0), config)
+    client.send_memory_report(_memory_report(0, 0, 0.92), config)
+
+    deadline = time.time() + 2
+    decisions = []
+    while time.time() < deadline:
+        decisions.extend(client.poll_budget_decisions())
+        if decisions:
+            break
+        time.sleep(0.01)
+
+    assert decisions
+    assert coordinator._recv_thread.is_alive()
+
+    client.close()
     coordinator.close()
 
 

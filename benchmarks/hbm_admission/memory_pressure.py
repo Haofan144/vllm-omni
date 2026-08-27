@@ -88,6 +88,7 @@ def main() -> int:
     emit("started", total_bytes=total, initial_pressure=initial)
     try:
         time.sleep(args.baseline_seconds)
+        emit("pressure_ramp_started", target=args.high_target, phase="high")
         reach_pressure(
             torch,
             args.device,
@@ -97,6 +98,7 @@ def main() -> int:
             args.reserve_mib * 1024**2,
         )
         time.sleep(args.high_seconds)
+        emit("pressure_ramp_started", target=args.critical_target, phase="critical")
         reach_pressure(
             torch,
             args.device,

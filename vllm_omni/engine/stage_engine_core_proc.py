@@ -92,11 +92,12 @@ class StageEngineCoreProc(EngineCoreProc):
         if future is None:
             return
         config = self.scheduler._dynamic_hbm_config
-        timed_out = (
+        future_done = future.done()
+        timed_out = not future_done and (
             time.monotonic() - getattr(self, "_dynamic_hbm_report_started_s", time.monotonic())
             >= config.report_timeout_ms / 1000
         )
-        if not future.done() and not timed_out:
+        if not future_done and not timed_out:
             return
         self._dynamic_hbm_report_future = None
 
@@ -115,7 +116,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
         rank_reports: list[RankMemoryReport] = []
         try:
-            if not timed_out:
+            if future_done:
                 payloads = future.result()
                 rank_reports = [RankMemoryReport(**payload) for payload in payloads if payload is not None]
             else:
@@ -124,8 +125,10 @@ class StageEngineCoreProc(EngineCoreProc):
         except Exception:
             logger.exception("[HBMCoordinator] failed to finish replica rank memory report")
 
-        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-        total_blocks = getattr(getattr(self.scheduler, "kv_cache_config", None), "num_blocks", None)
+        kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
+        has_kv_cache = bool(kv_cache_config and kv_cache_config.kv_cache_groups)
+        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() if has_kv_cache else None
+        total_blocks = kv_cache_config.num_blocks if has_kv_cache else None
         report = aggregator.aggregate(
             rank_reports,
             kv_total_blocks=total_blocks,

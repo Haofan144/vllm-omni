@@ -1,5 +1,35 @@
 # Dynamic HBM experiment
 
+## Milestone 0: reproducible characterization
+
+The Milestone-0 wrapper freezes the source/environment manifest, delegates the
+actual runs to the existing matrix runner, and converts existing case artifacts
+into paper-ready CSV tables. It does not change the server, coordinator,
+scheduler, or worker hot path.
+
+```bash
+.venv/bin/python benchmarks/hbm_admission/run_milestone0_characterization.py \
+  --spec benchmarks/hbm_admission/specs/qwen3_tts.yaml \
+  --output-dir benchmarks/results/milestone0_qwen3_tts \
+  --dry-run
+
+# Inspect matrix_plan.json and experiment_spec.yaml, then execute:
+.venv/bin/python benchmarks/hbm_admission/run_milestone0_characterization.py \
+  --spec benchmarks/hbm_admission/specs/qwen3_tts.yaml \
+  --output-dir benchmarks/results/milestone0_qwen3_tts
+```
+
+The wrapper produces `manifest.json`, per-run `runs.csv`, per-arm
+`aggregates.csv`, normalized `comparisons.csv`, `milestone0_report.json`, and a
+short `MILESTONE0_SUMMARY.md`. Existing artifacts can be reanalyzed without
+starting a server or GPU workload by adding `--summarize-only`.
+
+For the paper, retain at least three load levels, two pressure shapes, three
+repetitions, all A/B/C/D arms, and one E fixed-cap baseline. The example Qwen3
+TTS matrix already satisfies these structural checks. Burst and mixed-size
+claims still require a real burst-capable load generator and heterogeneous
+dataset; the report calls this out instead of inferring them from labels.
+
 ## Model-independent matrix runner
 
 For the full workload/pressure/controller matrix, copy the example spec and

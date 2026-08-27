@@ -36,10 +36,15 @@ def test_parse_centralized_cap_events_by_stage(tmp_path: Path) -> None:
     runner = _load_runner()
     log = tmp_path / "server.log"
     log.write_text(
+        "INFO [StageRuntime] Local dynamic-HBM coordinator started at tcp://127.0.0.1:26000\n"
         "INFO [HBMCoordinator] stage=0 replica=0 first central memory report sent ranks=1 pressure=0.4000\n"
         "INFO [HBMCoordinator] stage=1 replica=0 first central memory report sent ranks=1 pressure=0.4000\n"
         "INFO [HBMCoordinator] registered memory stream stage=0 replica=0 devices=[('node', 'gpu')]\n"
         "INFO [HBMCoordinator] registered memory stream stage=1 replica=0 devices=[('node', 'gpu')]\n"
+        "INFO [HBMCoordinator] central decision stage=0 replica=0 cap=16 "
+        "pressure=0.8400 reason=shared_device_high_pressure generation=2\n"
+        "INFO [HBMCoordinator] central decision stage=1 replica=0 cap=16 "
+        "pressure=0.8400 reason=shared_device_high_pressure generation=2\n"
         "INFO 08-13 12:00:01.250 [HBMCoordinator] stage=0 replica=0 cap=32->16 "
         "pressure=0.8400 reason=shared_device_high_pressure generation=2 mode=centralized\n"
         "INFO 08-13 12:00:01.300 [HBMCoordinator] stage=1 replica=0 cap=32->16 "
@@ -49,9 +54,11 @@ def test_parse_centralized_cap_events_by_stage(tmp_path: Path) -> None:
     parsed = runner.parse_server_events(log)
 
     assert parsed["cap_change_count"] == 2
+    assert parsed["local_coordinator_start_count"] == 1
     assert parsed["first_report_stage_ids"] == [0, 1]
     assert parsed["registered_stream_stage_ids"] == [0, 1]
     assert parsed["per_stage"]["0"]["shared_device_changes"] == 1
+    assert parsed["per_stage"]["0"]["shared_device_decisions"] == 1
     assert parsed["per_stage"]["1"]["minimum_observed_cap"] == 16
     assert parsed["cap_changes"][0]["log_second_of_day"] == pytest.approx(43201.25)
 
@@ -89,7 +96,7 @@ def test_acceptance_failure_still_contributes_runtime_metrics() -> None:
                     "status": "acceptance_failed",
                     "arm": {"name": "D_dynamic_on_pressure"},
                     "benchmark": {"request_throughput": 5.0},
-                    "scheduler": {"per_stage": {"0": {"shared_device_changes": 0}}},
+                    "scheduler": {"per_stage": {"0": {"shared_device_decisions": 0}}},
                     "acceptance": {"passed": False},
                 }
             ]
@@ -115,15 +122,45 @@ def test_pressure_parser_and_dynamic_acceptance(tmp_path: Path) -> None:
         "registered_stream_stage_ids": [0, 1],
         "minimum_observed_cap": 2,
         "oom_mentions": 0,
-        "per_stage": {"0": {"shared_device_changes": 1}, "1": {"shared_device_changes": 1}},
+        "per_stage": {"0": {"shared_device_decisions": 1}, "1": {"shared_device_decisions": 1}},
     }
 
     acceptance = runner.evaluate_case_acceptance(
-        runner.Arm("D_dynamic_on_pressure", True, True), scheduler, pressure, {0, 1}, 2
+        runner.Arm("D_dynamic_on_pressure", True, True),
+        scheduler
+        | {
+            "local_coordinator_start_count": 1,
+            "traceback_mentions": 0,
+        },
+        pressure,
+        {0, 1},
+        2,
+        True,
     )
 
     assert pressure["peak_reported_pressure"] == pytest.approx(0.921)
     assert acceptance["passed"]
+
+
+def test_acceptance_rejects_failed_execution_and_wrong_coordinator_lifecycle() -> None:
+    runner = _load_runner()
+
+    failed_static = runner.evaluate_case_acceptance(
+        runner.Arm("A_dynamic_off_no_pressure", False, False),
+        {
+            "local_coordinator_start_count": 1,
+            "first_reports": [],
+            "registered_streams": [],
+        },
+        {},
+        {0, 1},
+        2,
+        False,
+    )
+
+    assert not failed_static["passed"]
+    assert not failed_static["checks"]["case_execution_succeeded"]
+    assert not failed_static["checks"]["local_coordinator_start_matches_arm"]
 
 
 def test_generic_matrix_expands_workloads_pressure_and_controllers(tmp_path: Path) -> None:
@@ -162,11 +199,7 @@ def test_generic_matrix_rejects_unknown_runner_option(tmp_path: Path) -> None:
     matrix = _load_matrix_runner()
     (tmp_path / "deploy.yaml").write_text("stages: []\n")
     spec = tmp_path / "experiment.yaml"
-    spec.write_text(
-        "model: org/model\n"
-        "deploy_config: deploy.yaml\n"
-        "runner_options: {misspelled_watermark: 0.9}\n"
-    )
+    spec.write_text("model: org/model\ndeploy_config: deploy.yaml\nrunner_options: {misspelled_watermark: 0.9}\n")
 
     with pytest.raises(ValueError, match="unknown runner options"):
         matrix.build_cells(spec, tmp_path / "results")

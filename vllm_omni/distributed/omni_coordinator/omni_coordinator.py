@@ -73,6 +73,7 @@ class OmniCoordinator:
         self._budget_generations: dict[str, int] = {}
         self._budget_allocators: dict[str, BudgetAllocator] = {}
         self._last_caps: dict[str, int] = {}
+        self._last_reasons: dict[str, str] = {}
         self._memory_configs: dict[str, DynamicHBMConfig] = {}
         self._memory_received_at: dict[str, float] = {}
         self._last_allocation_at: dict[str, float] = {}
@@ -166,6 +167,7 @@ class OmniCoordinator:
         self._budget_generations.pop(input_addr, None)
         self._budget_allocators.pop(input_addr, None)
         self._last_caps.pop(input_addr, None)
+        self._last_reasons.pop(input_addr, None)
         self._memory_configs.pop(input_addr, None)
         self._memory_received_at.pop(input_addr, None)
         self._last_allocation_at.pop(input_addr, None)
@@ -284,10 +286,7 @@ class OmniCoordinator:
 
     @staticmethod
     def _device_keys(report: ReplicaMemoryReport) -> set[tuple[str, str]]:
-        return {
-            (rank.node_id, rank.device_uuid or f"local-device-{rank.device_id}")
-            for rank in report.rank_reports
-        }
+        return {(rank.node_id, rank.device_uuid or f"local-device-{rank.device_id}") for rank in report.rank_reports}
 
     def _handle_memory_report(self, data: dict[str, Any], routing_identity: bytes) -> None:
         """Update the central view and send decisions for all shared-device consumers."""
@@ -300,9 +299,7 @@ class OmniCoordinator:
             instance_id = str(data["instance_id"])
             report_generation = int(data["report_generation"])
             raw_report = dict(data["report"])
-            raw_report["rank_reports"] = tuple(
-                RankMemoryReport(**rank) for rank in raw_report.get("rank_reports", ())
-            )
+            raw_report["rank_reports"] = tuple(RankMemoryReport(**rank) for rank in raw_report.get("rank_reports", ()))
             report = ReplicaMemoryReport(**raw_report)
             config = DynamicHBMConfig.from_value(data.get("dynamic_hbm"))
         except (KeyError, TypeError, ValueError) as exc:
@@ -328,6 +325,16 @@ class OmniCoordinator:
         if report_generation <= self._memory_report_generations.get(input_addr, 0):
             return
 
+        incoming_devices = self._device_keys(report)
+        if not incoming_devices:
+            logger.warning(
+                "Dropping memory report without rank device telemetry: stage=%d replica=%d generation=%d",
+                report.stage_id,
+                report.replica_id,
+                report_generation,
+            )
+            return
+
         self._stage_routes[input_addr] = routing_identity
         self._memory_instances[input_addr] = instance_id
         self._memory_report_generations[input_addr] = report_generation
@@ -346,11 +353,8 @@ class OmniCoordinator:
                 sorted(self._device_keys(report)),
             )
 
-        incoming_devices = self._device_keys(report)
         affected = [
-            addr
-            for addr, candidate in self._memory_reports.items()
-            if incoming_devices & self._device_keys(candidate)
+            addr for addr, candidate in self._memory_reports.items() if incoming_devices & self._device_keys(candidate)
         ]
         # Device HBM is shared; KV blocks are private to a stage replica and
         # must not throttle unrelated consumers on the same physical GPU.
@@ -379,7 +383,7 @@ class OmniCoordinator:
             # need that update to leave critical admission mode.
             generation = self._budget_generations.get(addr, 0) + 1
             self._budget_generations[addr] = generation
-            self._last_caps[addr] = decision.effective_max_num_seqs
+            reason = decision.reason if len(affected) == 1 else f"shared_device_{decision.reason}"
             wire = {
                 "message_type": "budget_decision",
                 "stage_id": candidate.stage_id,
@@ -389,12 +393,28 @@ class OmniCoordinator:
                 "based_on_report_generation": self._memory_report_generations[addr],
                 "effective_max_num_seqs": decision.effective_max_num_seqs,
                 "pressure": effective_pressure,
-                "reason": decision.reason if len(affected) == 1 else f"shared_device_{decision.reason}",
+                "reason": reason,
             }
             try:
                 self._router.send_multipart([route, json.dumps(wire).encode("utf-8")], flags=zmq.NOBLOCK)
             except (zmq.Again, zmq.ZMQError):
                 logger.warning("Dropping HBM budget decision for %s", addr)
+            else:
+                previous_cap = self._last_caps.get(addr)
+                previous_reason = self._last_reasons.get(addr)
+                self._last_caps[addr] = decision.effective_max_num_seqs
+                self._last_reasons[addr] = reason
+                if previous_cap != decision.effective_max_num_seqs or previous_reason != reason:
+                    logger.info(
+                        "[HBMCoordinator] central decision stage=%d replica=%d cap=%d "
+                        "pressure=%.4f reason=%s generation=%d",
+                        candidate.stage_id,
+                        candidate.replica_id,
+                        decision.effective_max_num_seqs,
+                        effective_pressure,
+                        reason,
+                        generation,
+                    )
 
     def _check_memory_report_timeouts(self) -> None:
         """Fail safe when a live replica stops publishing memory samples."""

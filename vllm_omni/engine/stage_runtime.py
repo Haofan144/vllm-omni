@@ -18,6 +18,7 @@ import janus
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.core.memory_coordinator import DynamicHBMConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -25,6 +26,7 @@ from vllm_omni.distributed.omni_coordinator import (
     LeastQueueLengthBalancer,
     LoadBalancer,
     LoadBalancingPolicy,
+    OmniCoordinatorRuntime,
     RandomBalancer,
     RoundRobinBalancer,
 )
@@ -113,8 +115,9 @@ def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
 class StageRuntime:
     """Stage runtime for single-node (non-distributed) mode.
 
-    No coordinator, no master server, no hub. Launches stage processes
-    directly and creates StagePool with static clients.
+    Launches stage processes directly and creates StagePool with static
+    clients. A local coordinator is started only when at least one stage
+    enables dynamic HBM monitoring; no master server or hub is required.
     """
 
     def __init__(
@@ -151,6 +154,7 @@ class StageRuntime:
         # ``llm_stage_launch_lock`` for all replicas.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+        self._local_hbm_coordinator_runtime: OmniCoordinatorRuntime | None = None
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -260,16 +264,19 @@ class StageRuntime:
             raise exc
 
     def shutdown(self) -> None:
-        for pool in self.stage_pools:
-            for client in pool.clients:
-                if client is not None and hasattr(client, "shutdown"):
-                    try:
-                        client.shutdown()
-                    except Exception:
-                        logger.warning("[StageRuntime] client shutdown failed", exc_info=True)
-        if self._stage_init_executor is not None:
-            self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
-            self._stage_init_executor = None
+        try:
+            for pool in self.stage_pools:
+                for client in pool.clients:
+                    if client is not None and hasattr(client, "shutdown"):
+                        try:
+                            client.shutdown()
+                        except Exception:
+                            logger.warning("[StageRuntime] client shutdown failed", exc_info=True)
+            if self._stage_init_executor is not None:
+                self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
+                self._stage_init_executor = None
+        finally:
+            self._cleanup_local_hbm_coordinator()
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""
@@ -296,12 +303,73 @@ class StageRuntime:
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
-        """Hook for runtimes that need infrastructure before replica init."""
-        return None
+        """Start the optional local HBM coordinator before replica processes."""
+        if self._local_hbm_coordinator_runtime is not None:
+            return
+        if not self._any_stage_uses_dynamic_hbm(stage_plans):
+            return
+
+        # Start before any stage replica forks or initializes CUDA/ZMQ. Every
+        # local replica receives this router address during launch and will
+        # register its memory-report stream with the same coordinator.
+        self._local_hbm_coordinator_runtime = OmniCoordinatorRuntime(
+            host="127.0.0.1",
+            heartbeat_timeout=30.0,
+        )
+        logger.info(
+            "[StageRuntime] Local dynamic-HBM coordinator started at %s",
+            self._local_hbm_coordinator_runtime.router_address,
+        )
 
     def _cleanup_after_initialize_failure(self) -> None:
-        """Hook for runtimes that own extra infrastructure during init."""
-        return None
+        """Release optional local infrastructure after replica init fails."""
+        self._cleanup_local_hbm_coordinator()
+
+    @staticmethod
+    def _any_stage_uses_dynamic_hbm(stage_plans: Sequence[LogicalStageInitPlan]) -> bool:
+        """Return whether any planned stage enables dynamic HBM monitoring."""
+        for stage_plan in stage_plans:
+            for replica in stage_plan.replicas:
+                dynamic_hbm: Any = None
+                if replica.engine_args_dict is not None:
+                    dynamic_hbm = replica.engine_args_dict.get("dynamic_hbm")
+
+                # Diffusion plans do not currently materialize an
+                # engine_args_dict. Keep this fallback so the startup policy
+                # follows the stage configuration for every stage type.
+                if dynamic_hbm is None:
+                    stage_cfg = replica.stage_cfg
+                    engine_args = (
+                        stage_cfg.get("engine_args")
+                        if isinstance(stage_cfg, Mapping)
+                        else getattr(stage_cfg, "engine_args", None)
+                    )
+                    if engine_args is not None:
+                        dynamic_hbm = (
+                            engine_args.get("dynamic_hbm")
+                            if hasattr(engine_args, "get")
+                            else getattr(engine_args, "dynamic_hbm", None)
+                        )
+
+                if isinstance(dynamic_hbm, Mapping) and not isinstance(dynamic_hbm, dict):
+                    dynamic_hbm = dict(dynamic_hbm)
+                if DynamicHBMConfig.from_value(dynamic_hbm).enabled:
+                    return True
+        return False
+
+    def _cleanup_local_hbm_coordinator(self) -> None:
+        runtime = self._local_hbm_coordinator_runtime
+        if runtime is None:
+            return
+        try:
+            runtime.close()
+        except Exception:
+            logger.warning(
+                "[StageRuntime] local dynamic-HBM coordinator close failed",
+                exc_info=True,
+            )
+        finally:
+            self._local_hbm_coordinator_runtime = None
 
     @contextmanager
     def _scoped_spawn_device_env(self, physical_devices: str | None) -> Iterator[None]:
@@ -630,7 +698,9 @@ class StageRuntime:
                 release_device_locks(lock_fds)
 
     def _get_coordinator_address(self) -> str | None:
-        """Return coordinator router address. Overridden by DistStageRuntime."""
+        """Return the optional local coordinator router address."""
+        if self._local_hbm_coordinator_runtime is not None:
+            return self._local_hbm_coordinator_runtime.router_address
         return None
 
     def _get_omni_master_server(self) -> OmniMasterServer | None:

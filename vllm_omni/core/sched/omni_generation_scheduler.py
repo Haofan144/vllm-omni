@@ -37,6 +37,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
+        self._init_dynamic_hbm_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
 
@@ -81,7 +82,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
           default vLLM scheduling.
         """
 
-        token_budget = self.max_num_scheduled_tokens
+        token_budget = getattr(
+            self,
+            "_effective_max_num_scheduled_tokens",
+            self.max_num_scheduled_tokens,
+        )
         if self._pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
         scheduled_timestamp = time.monotonic()
@@ -168,7 +173,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_running = len(self.running)
             if self._retains_state_across_chunks and self.chunk_transfer_adapter is not None:
                 num_running += self.chunk_transfer_adapter.num_running_waiting_for_chunk
-            if num_running >= self.max_num_running_reqs:
+            if num_running >= self._dynamic_max_num_running_reqs():
                 break
 
             request = self.waiting.peek_request()
@@ -231,7 +236,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # requests with empty prompt_token_ids.
                 self._restore_omni_wait_queues()
             else:
-                res = super().schedule(throttle_prefills)
+                configured_max_num_running_reqs = self.max_num_running_reqs
+                configured_max_num_scheduled_tokens = self.max_num_scheduled_tokens
+                self.max_num_running_reqs = self._dynamic_max_num_running_reqs()
+                self.max_num_scheduled_tokens = token_budget
+                try:
+                    res = super().schedule(throttle_prefills)
+                finally:
+                    self.max_num_running_reqs = configured_max_num_running_reqs
+                    self.max_num_scheduled_tokens = configured_max_num_scheduled_tokens
                 self._restore_omni_wait_queues()
                 self._postprocess_omni_schedule_output(res)
                 return self._wrap_omni_scheduler_output(res)

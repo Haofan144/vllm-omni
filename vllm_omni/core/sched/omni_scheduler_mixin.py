@@ -25,6 +25,11 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.memory_coordinator import (
+    BudgetAllocator,
+    DynamicHBMConfig,
+    ReplicaMemoryReport,
+)
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
@@ -101,6 +106,99 @@ class OmniSchedulerMixin:
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
+
+    def _init_dynamic_hbm_scheduling_state(self) -> None:
+        """Initialize dynamic admission state for any Omni scheduler."""
+        self._dynamic_hbm_config = DynamicHBMConfig.from_value(
+            getattr(self.vllm_config.model_config, "dynamic_hbm", None)
+        )
+        self._configured_max_num_seqs = self.max_num_running_reqs
+        self._configured_max_num_scheduled_tokens = self.max_num_scheduled_tokens
+        self._effective_max_num_seqs = self._configured_max_num_seqs
+        self._effective_max_num_scheduled_tokens = self._configured_max_num_scheduled_tokens
+        self._last_budget_generation = 0
+        self._last_budget_report_generation = 0
+        self._dynamic_hbm_critical = False
+        self._dynamic_hbm_allocator = (
+            BudgetAllocator(self._dynamic_hbm_config, self._configured_max_num_seqs)
+            if self._dynamic_hbm_config.enabled
+            else None
+        )
+
+    def update_replica_memory_report(self, report: ReplicaMemoryReport) -> None:
+        """Apply a process-local decision when no central coordinator exists."""
+        config = getattr(self, "_dynamic_hbm_config", None)
+        allocator = getattr(self, "_dynamic_hbm_allocator", None)
+        if not config or not config.enabled or allocator is None:
+            return
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        if report.stage_id != stage_id:
+            return
+        decision = allocator.allocate(report)
+        self.apply_stage_budget_decision(
+            generation=getattr(self, "_last_budget_generation", 0) + 1,
+            effective_max_num_seqs=decision.effective_max_num_seqs,
+            pressure=decision.pressure,
+            reason=decision.reason,
+        )
+
+    def apply_stage_budget_decision(
+        self,
+        *,
+        generation: int,
+        effective_max_num_seqs: int,
+        pressure: float,
+        reason: str,
+        based_on_report_generation: int = 0,
+    ) -> bool:
+        """Apply a monotonic central dynamic-HBM decision."""
+        if generation <= self._last_budget_generation:
+            return False
+        if based_on_report_generation and based_on_report_generation < self._last_budget_report_generation:
+            return False
+        new_cap = min(
+            self._configured_max_num_seqs,
+            max(self._dynamic_hbm_config.min_num_seqs, int(effective_max_num_seqs)),
+        )
+        previous_cap = self._effective_max_num_seqs
+        self._effective_max_num_seqs = new_cap
+        if self._dynamic_hbm_config.scale_token_budget:
+            ratio = new_cap / self._configured_max_num_seqs
+            self._effective_max_num_scheduled_tokens = max(
+                new_cap,
+                int(self._configured_max_num_scheduled_tokens * ratio),
+            )
+        self._dynamic_hbm_critical = pressure >= self._dynamic_hbm_config.critical_watermark
+        self._last_budget_generation = generation
+        self._last_budget_report_generation = max(
+            self._last_budget_report_generation,
+            based_on_report_generation,
+        )
+        if previous_cap != new_cap:
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
+            logger.info(
+                "[HBMCoordinator] stage=%d replica=%d cap=%d->%d pressure=%.4f "
+                "reason=%s generation=%d mode=centralized",
+                stage_id,
+                replica_id,
+                previous_cap,
+                new_cap,
+                pressure,
+                reason,
+                generation,
+            )
+        return True
+
+    def _dynamic_max_num_running_reqs(self) -> int:
+        configured_cap = self.max_num_running_reqs
+        dynamic_cap = getattr(self, "_effective_max_num_seqs", configured_cap)
+        occupied_slots = len(self.running) + getattr(
+            self,
+            "num_waiting_for_streaming_input",
+            0,
+        )
+        return min(configured_cap, max(dynamic_cap, occupied_slots))
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""

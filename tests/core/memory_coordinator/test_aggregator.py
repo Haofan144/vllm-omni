@@ -82,6 +82,7 @@ def test_engine_core_collects_all_replica_ranks(monkeypatch) -> None:
     scheduler.waiting = [object()] * 3
     scheduler.kv_cache_manager.block_pool.get_num_free_blocks.return_value = 20
     scheduler.kv_cache_config.num_blocks = 100
+    scheduler.kv_cache_config.kv_cache_groups = [object()]
     engine.scheduler = scheduler
     engine.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=1),
@@ -111,3 +112,71 @@ def test_engine_core_collects_all_replica_ranks(monkeypatch) -> None:
         timeout=1.5,
         non_block=True,
     )
+
+
+def test_engine_core_keeps_completed_rank_report_checked_after_deadline(monkeypatch) -> None:
+    """A long model step may delay polling a future that already completed."""
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    scheduler = MagicMock()
+    scheduler._dynamic_hbm_config = DynamicHBMConfig(
+        enabled=True,
+        sample_interval_ms=1,
+        report_timeout_ms=2,
+    )
+    scheduler._configured_max_num_seqs = 16
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks.return_value = 20
+    scheduler.kv_cache_config.num_blocks = 100
+    engine.scheduler = scheduler
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_id=1),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+    )
+    future = MagicMock()
+    future.done.return_value = True
+    future.result.return_value = [_rank(0, 500).__dict__]
+    engine._dynamic_hbm_report_future = future
+    engine._dynamic_hbm_report_started_s = 1.0
+    monkeypatch.setattr("vllm_omni.engine.stage_engine_core_proc.time.monotonic", lambda: 10.0)
+    monkeypatch.setenv("VLLM_OMNI_REPLICA_ID", "2")
+
+    engine._maybe_finish_dynamic_hbm_report()
+
+    report = scheduler.update_replica_memory_report.call_args.args[0]
+    assert report.complete
+    future.cancel.assert_not_called()
+
+
+def test_engine_core_omits_dummy_block_pressure_for_model_without_kv_cache(
+    monkeypatch,
+) -> None:
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    scheduler = MagicMock()
+    scheduler._dynamic_hbm_config = DynamicHBMConfig(enabled=True, sample_interval_ms=1)
+    scheduler._configured_max_num_seqs = 16
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.kv_cache_config.num_blocks = 1
+    scheduler.kv_cache_config.kv_cache_groups = []
+    engine.scheduler = scheduler
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_id=1),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+    )
+    future = MagicMock()
+    future.done.return_value = True
+    future.result.return_value = [_rank(0, 700).__dict__]
+    engine._dynamic_hbm_report_future = future
+    engine._dynamic_hbm_report_started_s = 1.0
+    monkeypatch.setattr("vllm_omni.engine.stage_engine_core_proc.time.monotonic", lambda: 1.0)
+    monkeypatch.setenv("VLLM_OMNI_REPLICA_ID", "2")
+
+    engine._maybe_finish_dynamic_hbm_report()
+
+    report = scheduler.update_replica_memory_report.call_args.args[0]
+    assert report.kv_total_blocks is None
+    assert report.kv_free_blocks is None
+    assert report.kv_pressure == 0.0
+    assert report.pressure == pytest.approx(0.3)
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks.assert_not_called()

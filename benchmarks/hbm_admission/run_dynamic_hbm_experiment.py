@@ -41,6 +41,11 @@ FIRST_REPORT_RE = re.compile(
 REGISTERED_STREAM_RE = re.compile(
     r"\[HBMCoordinator\] registered memory stream stage=(\d+) replica=(\d+) devices=(.+)$"
 )
+LOCAL_COORDINATOR_STARTED_RE = re.compile(r"\[StageRuntime\] Local dynamic-HBM coordinator started at (\S+)")
+CENTRAL_DECISION_RE = re.compile(
+    r"\[HBMCoordinator\] central decision stage=(\d+) replica=(\d+) cap=(\d+) "
+    r"pressure=([0-9.]+) reason=(\S+) generation=(\d+)"
+)
 LOG_TIME_RE = re.compile(r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:[,.](?P<fraction>\d+))?")
 
 
@@ -352,9 +357,23 @@ def parse_gpu_csv(path: Path) -> dict[str, Any]:
 def parse_server_events(path: Path) -> dict[str, Any]:
     contents = path.read_text(errors="replace")
     changes = []
+    central_decisions = []
     first_reports = []
     registered_streams = []
+    local_coordinator_addresses = LOCAL_COORDINATOR_STARTED_RE.findall(contents)
     for line_number, line in enumerate(contents.splitlines(), start=1):
+        if match := CENTRAL_DECISION_RE.search(line):
+            central_decisions.append(
+                {
+                    "stage_id": int(match.group(1)),
+                    "replica_id": int(match.group(2)),
+                    "cap": int(match.group(3)),
+                    "pressure": float(match.group(4)),
+                    "reason": match.group(5),
+                    "generation": int(match.group(6)),
+                    "line_number": line_number,
+                }
+            )
         if match := FIRST_REPORT_RE.search(line):
             first_reports.append(
                 {
@@ -388,22 +407,25 @@ def parse_server_events(path: Path) -> dict[str, Any]:
             )
         changes.append(
             {
-            "stage_id": int(match.group(1)),
-            "replica_id": int(match.group(2)),
-            "old_cap": int(match.group(3)),
-            "new_cap": int(match.group(4)),
-            "pressure": float(match.group(5)),
-            "reason": match.group(6),
-            "line_number": line_number,
-            "log_second_of_day": log_second,
-        }
+                "stage_id": int(match.group(1)),
+                "replica_id": int(match.group(2)),
+                "old_cap": int(match.group(3)),
+                "new_cap": int(match.group(4)),
+                "pressure": float(match.group(5)),
+                "reason": match.group(6),
+                "line_number": line_number,
+                "log_second_of_day": log_second,
+            }
         )
     lowered = contents.lower()
     return {
+        "local_coordinator_start_count": len(local_coordinator_addresses),
+        "local_coordinator_addresses": local_coordinator_addresses,
         "first_reports": first_reports,
         "first_report_stage_ids": sorted({item["stage_id"] for item in first_reports}),
         "registered_streams": registered_streams,
         "registered_stream_stage_ids": sorted({item["stage_id"] for item in registered_streams}),
+        "central_decisions": central_decisions,
         "cap_changes": changes,
         "cap_change_count": len(changes),
         "minimum_observed_cap": min((item["new_cap"] for item in changes), default=None),
@@ -422,11 +444,16 @@ def parse_server_events(path: Path) -> dict[str, Any]:
                     default=None,
                 ),
                 "shared_device_changes": sum(
+                    item["stage_id"] == stage_id and item["reason"].startswith("shared_device_") for item in changes
+                ),
+                "shared_device_decisions": sum(
                     item["stage_id"] == stage_id and item["reason"].startswith("shared_device_")
-                    for item in changes
+                    for item in central_decisions
                 ),
             }
-            for stage_id in sorted({item["stage_id"] for item in changes})
+            for stage_id in sorted(
+                {item["stage_id"] for item in changes} | {item["stage_id"] for item in central_decisions}
+            )
         },
     }
 
@@ -457,23 +484,33 @@ def evaluate_case_acceptance(
     pressure: dict[str, Any],
     expected_stage_ids: set[int],
     min_num_seqs: int,
+    execution_succeeded: bool,
 ) -> dict[str, Any]:
-    checks: dict[str, bool] = {}
+    checks: dict[str, bool] = {
+        "case_execution_succeeded": execution_succeeded,
+        "local_coordinator_start_matches_arm": scheduler.get("local_coordinator_start_count", 0) == int(arm.dynamic),
+    }
     if arm.dynamic:
-        checks["all_stages_sent_memory_reports"] = set(scheduler.get("first_report_stage_ids", [])) == expected_stage_ids
+        checks["all_stages_sent_memory_reports"] = (
+            set(scheduler.get("first_report_stage_ids", [])) == expected_stage_ids
+        )
         checks["all_stages_registered_centrally"] = (
             set(scheduler.get("registered_stream_stage_ids", [])) == expected_stage_ids
+        )
+    else:
+        checks["no_central_memory_streams"] = not scheduler.get("first_reports") and not scheduler.get(
+            "registered_streams"
         )
     if arm.pressure:
         checks["pressure_high_and_critical_targets_reached"] = pressure.get("target_reached_count", 0) >= 2
     if arm.dynamic and arm.pressure:
         per_stage = scheduler.get("per_stage", {})
-        checks["all_stages_received_shared_device_changes"] = all(
-            per_stage.get(str(stage_id), {}).get("shared_device_changes", 0) > 0
-            for stage_id in expected_stage_ids
+        checks["all_stages_received_shared_device_decisions"] = all(
+            per_stage.get(str(stage_id), {}).get("shared_device_decisions", 0) > 0 for stage_id in expected_stage_ids
         )
         checks["minimum_cap_reached"] = scheduler.get("minimum_observed_cap") == min_num_seqs
         checks["no_server_oom"] = scheduler.get("oom_mentions", 0) == 0
+        checks["no_server_traceback"] = scheduler.get("traceback_mentions", 0) == 0
     return {"passed": all(checks.values()), "checks": checks}
 
 
@@ -488,11 +525,7 @@ def resolve_metric(payload: dict[str, Any], dotted_path: str) -> float | None:
 
 def analyze_summary(summary: dict[str, Any], metric_map: dict[str, str]) -> dict[str, Any]:
     """Build model-independent comparisons from normalized metric paths."""
-    completed = [
-        case
-        for case in summary["cases"]
-        if case.get("status") in {"completed", "acceptance_failed"}
-    ]
+    completed = [case for case in summary["cases"] if case.get("status") in {"completed", "acceptance_failed"}]
     by_arm: dict[str, list[dict[str, Any]]] = {}
     for case in completed:
         by_arm.setdefault(case["arm"]["name"], []).append(case)
@@ -517,15 +550,13 @@ def analyze_summary(summary: dict[str, Any], metric_map: dict[str, str]) -> dict
 
     dynamic_pressure_cases = by_arm.get("D_dynamic_on_pressure", [])
     stage_ids = {
-        stage_id
-        for case in dynamic_pressure_cases
-        for stage_id in case.get("scheduler", {}).get("per_stage", {})
+        stage_id for case in dynamic_pressure_cases for stage_id in case.get("scheduler", {}).get("per_stage", {})
     }
     shared_stage_ids = {
         stage_id
         for case in dynamic_pressure_cases
         for stage_id, stage in case.get("scheduler", {}).get("per_stage", {}).items()
-        if stage.get("shared_device_changes", 0) > 0
+        if stage.get("shared_device_decisions", 0) > 0
     }
     return {
         "normalized_metrics": normalized,
@@ -645,6 +676,7 @@ def run_case(args: argparse.Namespace, arm: Arm, repeat: int) -> dict[str, Any]:
         status["pressure"],
         expected_stage_ids,
         min(args.min_num_seqs, arm.fixed_cap or args.max_num_seqs),
+        status["status"] == "completed",
     )
     if status["status"] == "completed" and not status["acceptance"]["passed"]:
         status["status"] = "acceptance_failed"

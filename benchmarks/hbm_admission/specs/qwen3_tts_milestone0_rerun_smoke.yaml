@@ -1,0 +1,56 @@
+# Fresh post-fix validation matrix for the single-node StageRuntime coordinator.
+# This is a functional gate, not the full paper-scale characterization matrix.
+model: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+deploy_config: ../../../vllm_omni/deploy/qwen3_tts.yaml
+request_profile: qwen3-tts
+dataset_path: ../../build_dataset/seed_tts_smoke
+repeats: 1
+arms:
+  - A_dynamic_off_no_pressure
+  - B_dynamic_on_no_pressure
+  - C_dynamic_off_pressure
+  - D_dynamic_on_pressure
+dynamic_stage_ids: [0, 1]
+
+metric_map:
+  throughput: request_throughput
+  p99_latency_ms: p99_e2el_ms
+  p99_first_output_ms: p99_audio_ttfp_ms
+
+runner_options:
+  max_num_seqs: 32
+  min_num_seqs: 2
+  include_fixed_cap: 8
+  startup_timeout: 1800
+  benchmark_timeout: 1200
+  pressure_wait_timeout: 120
+
+workloads:
+  - name: functional
+    concurrency: 8
+    num_prompts: 20
+
+pressure_profiles:
+  - name: short_step
+    options:
+      pressure_baseline_seconds: 3
+      pressure_high_target: 0.84
+      pressure_high_seconds: 5
+      pressure_critical_target: 0.92
+      pressure_critical_seconds: 5
+      pressure_recovery_target: 0.68
+      pressure_recovery_seconds: 5
+      pressure_post_release_seconds: 10
+      pressure_chunk_mib: 128
+
+controllers:
+  - name: fast_validation
+    options:
+      sample_interval_ms: 500
+      report_timeout_ms: 1500
+      low_watermark: 0.72
+      high_watermark: 0.82
+      critical_watermark: 0.90
+      scale_down_ratio: 0.5
+      scale_up_step: 2
+      scale_up_stable_samples: 6

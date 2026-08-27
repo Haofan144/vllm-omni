@@ -19,6 +19,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.memory_coordinator import (
     BudgetAllocator,
     DynamicHBMConfig,
@@ -112,6 +113,32 @@ def test_dynamic_admission_cap_never_evicts_running_requests() -> None:
     sched.num_waiting_for_streaming_input = 1
 
     assert sched._dynamic_max_num_running_reqs() == 7
+
+
+def test_generation_scheduler_applies_dynamic_hbm_cap_without_evicting_running_requests() -> None:
+    sched = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    sched.max_num_running_reqs = 16
+    sched.max_num_scheduled_tokens = 4096
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_id=1,
+            dynamic_hbm={"enabled": True, "min_num_seqs": 2},
+        )
+    )
+    sched.running = [object()] * 5
+    sched._init_dynamic_hbm_scheduling_state()
+
+    assert sched.apply_stage_budget_decision(
+        generation=1,
+        based_on_report_generation=1,
+        effective_max_num_seqs=4,
+        pressure=0.92,
+        reason="shared_device_high_pressure",
+    )
+
+    assert sched._effective_max_num_seqs == 4
+    assert sched._dynamic_max_num_running_reqs() == 5
+    assert sched._effective_max_num_scheduled_tokens == 1024
 
 
 def test_central_budget_decision_rejects_stale_generation() -> None:
