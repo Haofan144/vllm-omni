@@ -1,0 +1,128 @@
+{
+  "hypothesis_id": "H7",
+  "title": "Fail-closed on disconnect / stale / missing-rank / stale-generation",
+  "hypothesis": "Coordinator loss, stale telemetry, incomplete reports, and replayed/stale generations all stop expansion and (where relevant) tighten admission, without evicting running requests or advancing state off a stale input.",
+  "expectation": "a: disconnect->0 & retain running; b: STALE decrease; c: incomplete held then decreased, never NORMAL; d: old/equal/stale-report generations rejected; e: KV guard keeps channel live.",
+  "verdict": "MATCHES_EXPECTATION",
+  "checks": [
+    {
+      "name": "a: disconnect -> cap 0, DISCONNECTED, 5 running retained, no new admission",
+      "passed": true,
+      "detail": "{'guard_applied': True, 'safety_cap': 0, 'effective_cap': 0, 'state': 'disconnected', 'execution_budget_running': 5, 'allows_new_admission': False}"
+    },
+    {
+      "name": "b: stale report -> STALE decisions, cap monotonically non-increasing, telemetry_health source",
+      "passed": true,
+      "detail": "cap_before=8, stale cap sequence=[8, 4, 2, 1, 0]"
+    },
+    {
+      "name": "c: first incomplete report(s) are HELD for missing_report_grace_samples",
+      "passed": true,
+      "detail": "grace=1, held step=('incomplete_1', 16, 'incomplete', 'incomplete_rank_reports_hold')"
+    },
+    {
+      "name": "c: a further incomplete report DECREASES the cap (never expands, never 'low pressure')",
+      "passed": true,
+      "detail": "decrease step=('incomplete_2', 8, 'stale', 'incomplete_rank_reports_decrease')"
+    },
+    {
+      "name": "c: no incomplete step is ever NORMAL or increases the cap",
+      "passed": true,
+      "detail": "states=['incomplete', 'stale', 'stale']"
+    },
+    {
+      "name": "d: older / equal decision generation and stale report generation are all rejected",
+      "passed": true,
+      "detail": "{'cap_after_g5': 8, 'older_generation_accepted': False, 'equal_generation_accepted': False, 'stale_report_generation_accepted': False, 'final_safety_cap': 8}"
+    },
+    {
+      "name": "e: local KV guard tightens immediately and does not block the next coordinator decision",
+      "passed": true,
+      "detail": "{'kv_guard_applied': True, 'post_decision_accepted': True, 'final_state': 'high_pressure'}"
+    }
+  ],
+  "observations": {
+    "a_disconnect": {
+      "guard_applied": true,
+      "safety_cap": 0,
+      "effective_cap": 0,
+      "state": "disconnected",
+      "execution_budget_running": 5,
+      "allows_new_admission": false
+    },
+    "b_stale": {
+      "cap_before_stale": 8,
+      "decisions": [
+        [
+          "stale_report_incomplete_rank_reports_hold",
+          "stale",
+          "telemetry_health",
+          8
+        ],
+        [
+          "stale_report_incomplete_rank_reports_decrease",
+          "stale",
+          "telemetry_health",
+          4
+        ],
+        [
+          "stale_report_incomplete_rank_reports_decrease",
+          "stale",
+          "telemetry_health",
+          2
+        ],
+        [
+          "stale_report_incomplete_rank_reports_decrease",
+          "stale",
+          "telemetry_health",
+          1
+        ],
+        [
+          "stale_report_incomplete_rank_reports_decrease",
+          "stale",
+          "telemetry_health",
+          0
+        ]
+      ]
+    },
+    "c_incomplete": [
+      [
+        "complete_calm",
+        16,
+        "normal",
+        "awaiting_stable_headroom"
+      ],
+      [
+        "incomplete_1",
+        16,
+        "incomplete",
+        "incomplete_rank_reports_hold"
+      ],
+      [
+        "incomplete_2",
+        8,
+        "stale",
+        "incomplete_rank_reports_decrease"
+      ],
+      [
+        "incomplete_3",
+        4,
+        "stale",
+        "incomplete_rank_reports_decrease"
+      ]
+    ],
+    "d_generation": {
+      "cap_after_g5": 8,
+      "older_generation_accepted": false,
+      "equal_generation_accepted": false,
+      "stale_report_generation_accepted": false,
+      "final_safety_cap": 8
+    },
+    "e_kv_guard": {
+      "kv_guard_applied": true,
+      "post_decision_accepted": true,
+      "final_state": "high_pressure"
+    }
+  },
+  "analysis": "MATCHES EXPECTATION on all five fault paths.\n(a) apply_dynamic_hbm_disconnect_guard takes min(current_safety_cap, disconnect_admission_cap)=0 and sets DISCONNECTED; the execution budget still equals the running count, so the 5 in-flight requests are not evicted, but _dynamic_hbm_allows_new_admission() is False. This is a purely local action - it fires without any message from the (now gone) coordinator.\n(b) _check_memory_report_timeouts_locked, once report age exceeds report_timeout_ms, synthesises a report with an EMPTY rank tuple and runs it through the same BudgetAllocator; the empty-rank path multiplicatively decreases the cap, and the wire decision is tagged safety_state=stale, reason=stale_report_*, pressure_source=telemetry_health. Expansion is impossible while stale.\n(c) In BudgetAllocator the incomplete branch holds the cap for missing_report_grace_samples (state=incomplete) then multiplicatively decreases (state=stale, reason=incomplete_rank_reports_decrease). No incomplete report can reach the low-pressure branch, so a half-missing report can never be mistaken for headroom and can never expand the cap.\n(d) apply_stage_budget_decision rejects any decision whose generation <= the last applied generation, and any decision whose based_on_report_generation < the last report generation. An older replay, an equal-generation replay, and a decision built on a stale report are all dropped, leaving the last good cap (8) intact.\n(e) apply_dynamic_hbm_local_kv_guard tightens to critical_admission_cap immediately WITHOUT advancing _last_budget_generation, so the next genuine coordinator decision (generation 8) still applies and reconciles the replica. Fail-closed here does not wedge the control channel.\nAcross all paths the invariant holds: faults stop expansion and (where visibility is lost) tighten admission, but never kill running work and never let a stale input drive state."
+}

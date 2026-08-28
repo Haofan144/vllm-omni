@@ -1,0 +1,63 @@
+# H2: Coordinator identifies stages sharing one physical GPU
+
+**Hypothesis.** Stages are grouped by (node_id, device_uuid); a pressure signal from one co-resident stage reaches all of them, and stages on distinct devices stay decoupled.
+
+**Expectation.** A groups & propagates with shared_device_* tag; B/C/D stay decoupled.
+
+**Verdict.** MATCHES EXPECTATION
+
+## Checks
+
+| # | Check | Result | Detail |
+|---|---|---|---|
+| 1 | A: shared uuid propagates high pressure to both stages | PASS | [(0, 'shared_device_high_pressure', 'shared_physical_hbm', 8), (1, 'shared_device_high_pressure', 'shared_physical_hbm', 8)] |
+| 2 | A: shared decision tagged shared_device_high_pressure / shared_physical_hbm | PASS | reasons=['shared_device_high_pressure', 'shared_device_high_pressure'] |
+| 3 | B: distinct uuid -> peer stage on other GPU is untouched | PASS | [(0, 'high_pressure', 8)] |
+| 4 | C: equal local device_id on different nodes are NOT grouped | PASS | [(0, 'high_pressure', 8)] |
+| 5 | D: same node/device_id but different uuid are NOT grouped | PASS | [(0, 'high_pressure', 8)] |
+
+## Observations
+
+```json
+{
+  "A_decisions": [
+    [
+      0,
+      "shared_device_high_pressure",
+      "shared_physical_hbm",
+      8
+    ],
+    [
+      1,
+      "shared_device_high_pressure",
+      "shared_physical_hbm",
+      8
+    ]
+  ],
+  "B_decisions": [
+    [
+      0,
+      "high_pressure",
+      8
+    ]
+  ],
+  "C_decisions": [
+    [
+      0,
+      "high_pressure",
+      8
+    ]
+  ],
+  "D_decisions": [
+    [
+      0,
+      "high_pressure",
+      8
+    ]
+  ]
+}
+```
+
+## Analysis
+
+MATCHES EXPECTATION. OmniCoordinator._device_keys builds the grouping key as (node_id, device_uuid or 'local-device-<device_id>'), and _handle_memory_report_locked computes `affected` as every registered replica whose device-key set intersects the incoming report's. Sub-case A confirms a single high-pressure report fans a decision out to every co-resident stage with reason `shared_device_high_pressure` and pressure_source `shared_physical_hbm`, and the cap drop (16->8) is applied to the peer that never saw pressure itself. Sub-cases B/C/D confirm the negative direction: a different UUID, a different node_id behind an empty UUID, or a different UUID on the same node all keep the replicas in disjoint groups, so cross-talk cannot happen. The design's multi-node identity rule (never trust the bare local index) holds.
