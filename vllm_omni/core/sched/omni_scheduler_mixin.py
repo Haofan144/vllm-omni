@@ -29,6 +29,7 @@ from vllm_omni.core.memory_coordinator import (
     BudgetAllocator,
     DynamicHBMConfig,
     ReplicaMemoryReport,
+    SafetyState,
 )
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -114,11 +115,14 @@ class OmniSchedulerMixin:
         )
         self._configured_max_num_seqs = self.max_num_running_reqs
         self._configured_max_num_scheduled_tokens = self.max_num_scheduled_tokens
+        self._safety_max_num_seqs = self._configured_max_num_seqs
+        self._safety_max_num_scheduled_tokens = self._configured_max_num_scheduled_tokens
         self._effective_max_num_seqs = self._configured_max_num_seqs
         self._effective_max_num_scheduled_tokens = self._configured_max_num_scheduled_tokens
         self._last_budget_generation = 0
         self._last_budget_report_generation = 0
         self._dynamic_hbm_critical = False
+        self._dynamic_hbm_safety_state = SafetyState.NORMAL
         self._dynamic_hbm_allocator = (
             BudgetAllocator(self._dynamic_hbm_config, self._configured_max_num_seqs)
             if self._dynamic_hbm_config.enabled
@@ -134,12 +138,60 @@ class OmniSchedulerMixin:
         stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
         if report.stage_id != stage_id:
             return
+        if not hasattr(self, "_configured_max_num_seqs"):
+            self._configured_max_num_seqs = report.configured_max_num_seqs
+        if not hasattr(self, "_configured_max_num_scheduled_tokens"):
+            self._configured_max_num_scheduled_tokens = getattr(
+                self,
+                "max_num_scheduled_tokens",
+                report.configured_max_num_seqs,
+            )
+        if not hasattr(self, "_safety_max_num_seqs"):
+            self._safety_max_num_seqs = self._configured_max_num_seqs
         decision = allocator.allocate(report)
         self.apply_stage_budget_decision(
             generation=getattr(self, "_last_budget_generation", 0) + 1,
             effective_max_num_seqs=decision.effective_max_num_seqs,
             pressure=decision.pressure,
             reason=decision.reason,
+            safety_state=decision.safety_state,
+            pressure_source=decision.pressure_source,
+        )
+
+    def _recompute_effective_dynamic_hbm_budget(self) -> None:
+        """Combine configured and reactive-safety limits.
+
+        A future predictive planner can add its own cap to this minimum
+        without granting the safety controller authority to expand past it.
+        """
+        configured_seqs = self._configured_max_num_seqs
+        configured_tokens = getattr(
+            self,
+            "_configured_max_num_scheduled_tokens",
+            getattr(self, "max_num_scheduled_tokens", configured_seqs),
+        )
+        self._effective_max_num_seqs = min(
+            configured_seqs,
+            self._safety_max_num_seqs,
+        )
+        if self._dynamic_hbm_config.scale_token_budget:
+            occupied_slots = len(getattr(self, "running", ())) + getattr(
+                self,
+                "num_waiting_for_streaming_input",
+                0,
+            )
+            scheduling_slots = max(self._effective_max_num_seqs, occupied_slots)
+            ratio = min(1.0, scheduling_slots / configured_seqs)
+            self._safety_max_num_scheduled_tokens = max(
+                1,
+                self._effective_max_num_seqs,
+                int(configured_tokens * ratio),
+            )
+        else:
+            self._safety_max_num_scheduled_tokens = configured_tokens
+        self._effective_max_num_scheduled_tokens = min(
+            configured_tokens,
+            self._safety_max_num_scheduled_tokens,
         )
 
     def apply_stage_budget_decision(
@@ -150,32 +202,57 @@ class OmniSchedulerMixin:
         pressure: float,
         reason: str,
         based_on_report_generation: int = 0,
+        safety_state: str = SafetyState.NORMAL.value,
+        pressure_source: str = "none",
     ) -> bool:
         """Apply a monotonic central dynamic-HBM decision."""
-        if generation <= self._last_budget_generation:
+        last_budget_generation = getattr(self, "_last_budget_generation", 0)
+        last_report_generation = getattr(self, "_last_budget_report_generation", 0)
+        if generation <= last_budget_generation:
             return False
-        if based_on_report_generation and based_on_report_generation < self._last_budget_report_generation:
+        if based_on_report_generation and based_on_report_generation < last_report_generation:
             return False
-        new_cap = min(
-            self._configured_max_num_seqs,
-            max(self._dynamic_hbm_config.min_num_seqs, int(effective_max_num_seqs)),
+        try:
+            state = SafetyState(safety_state)
+        except ValueError:
+            logger.warning("Dropping dynamic-HBM decision with unknown safety state %r", safety_state)
+            return False
+        normal_floor = self._dynamic_hbm_config.min_num_seqs
+        floor = (
+            self._dynamic_hbm_config.critical_admission_cap
+            if state in {
+                SafetyState.CRITICAL,
+                SafetyState.STALE,
+                SafetyState.DISCONNECTED,
+                SafetyState.RECOVERING,
+            }
+            else normal_floor
         )
-        previous_cap = self._effective_max_num_seqs
-        self._effective_max_num_seqs = new_cap
-        if self._dynamic_hbm_config.scale_token_budget:
-            ratio = new_cap / self._configured_max_num_seqs
-            self._effective_max_num_scheduled_tokens = max(
-                new_cap,
-                int(self._configured_max_num_scheduled_tokens * ratio),
+        if state is SafetyState.CRITICAL:
+            new_cap = min(
+                self._configured_max_num_seqs,
+                self._dynamic_hbm_config.critical_admission_cap,
+                max(0, int(effective_max_num_seqs)),
             )
-        self._dynamic_hbm_critical = pressure >= self._dynamic_hbm_config.critical_watermark
+        else:
+            new_cap = min(
+                self._configured_max_num_seqs,
+                max(floor, int(effective_max_num_seqs)),
+            )
+        previous_cap = self._effective_max_num_seqs
+        self._safety_max_num_seqs = new_cap
+        self._dynamic_hbm_safety_state = state
+        self._dynamic_hbm_critical = state is SafetyState.CRITICAL
+        self._dynamic_hbm_pressure_source = pressure_source
+        self._recompute_effective_dynamic_hbm_budget()
         self._last_budget_generation = generation
         self._last_budget_report_generation = max(
-            self._last_budget_report_generation,
+            last_report_generation,
             based_on_report_generation,
         )
         if previous_cap != new_cap:
-            stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            stage_id = getattr(model_config, "stage_id", 0)
             replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
             logger.info(
                 "[HBMCoordinator] stage=%d replica=%d cap=%d->%d pressure=%.4f "
@@ -189,6 +266,47 @@ class OmniSchedulerMixin:
                 generation,
             )
         return True
+
+    def apply_dynamic_hbm_disconnect_guard(self) -> bool:
+        """Fail closed locally when the central safety stream is unavailable."""
+        config = getattr(self, "_dynamic_hbm_config", None)
+        if not config or not config.enabled or not config.fail_closed_on_disconnect:
+            return False
+        self._safety_max_num_seqs = min(
+            getattr(self, "_safety_max_num_seqs", self._configured_max_num_seqs),
+            config.disconnect_admission_cap,
+        )
+        self._dynamic_hbm_safety_state = SafetyState.DISCONNECTED
+        self._dynamic_hbm_critical = False
+        self._dynamic_hbm_pressure_source = "telemetry_health"
+        self._recompute_effective_dynamic_hbm_budget()
+        return True
+
+    def apply_dynamic_hbm_local_kv_guard(self) -> bool:
+        """Stop admission immediately when the local KV pool is exhausted.
+
+        This local safety action deliberately does not consume a central
+        decision generation. The next fresh coordinator decision can still
+        reconcile the replica after its report observes the KV state.
+        """
+        config = getattr(self, "_dynamic_hbm_config", None)
+        if not config or not config.enabled:
+            return False
+        self._safety_max_num_seqs = min(
+            getattr(self, "_safety_max_num_seqs", self._configured_max_num_seqs),
+            config.critical_admission_cap,
+        )
+        self._dynamic_hbm_safety_state = SafetyState.CRITICAL
+        self._dynamic_hbm_critical = True
+        self._dynamic_hbm_pressure_source = "kv"
+        self._recompute_effective_dynamic_hbm_budget()
+        return True
+
+    def _dynamic_hbm_allows_new_admission(self) -> bool:
+        if not getattr(getattr(self, "_dynamic_hbm_config", None), "enabled", False):
+            return True
+        occupied_slots = len(self.running) + getattr(self, "num_waiting_for_streaming_input", 0)
+        return occupied_slots < self._effective_max_num_seqs
 
     def _dynamic_max_num_running_reqs(self) -> int:
         configured_cap = self.max_num_running_reqs

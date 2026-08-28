@@ -91,6 +91,36 @@ def test_stage_client_update_info_sends_correct_event():
     ctx.term()
 
 
+def test_stage_client_sends_budget_applied_ack():
+    ctx, router, endpoint = _bind_router()
+    client = OmniCoordClientForStage(
+        endpoint,
+        "tcp://stage:ack-in",
+        "tcp://stage:ack-out",
+        3,
+        replica_id=2,
+    )
+    _recv_event(router)
+
+    client.send_budget_applied(
+        decision_generation=7,
+        applied_safety_cap=0,
+        effective_cap=0,
+        occupied_slots=4,
+        applied_monotonic_s=12.5,
+    )
+
+    event = _recv_event(router)
+    assert event["message_type"] == "budget_applied"
+    assert event["decision_generation"] == 7
+    assert event["applied_safety_cap"] == 0
+    assert event["occupied_slots"] == 4
+
+    client.close()
+    router.close(0)
+    ctx.term()
+
+
 def test_stage_client_close_sends_down_status():
     """Verify close() sends final status-down event before closing underlying socket."""
     ctx, router, endpoint = _bind_router()

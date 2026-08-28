@@ -20,6 +20,16 @@ class DynamicHBMConfig:
     scale_down_ratio: float = 0.5
     scale_up_stable_samples: int = 5
     scale_token_budget: bool = True
+    # ``min_num_seqs`` is the normal operating floor. Under critical HBM
+    # pressure it must be possible to stop *new* admission completely while
+    # allowing already-running requests to drain.
+    critical_admission_cap: int = 0
+    disconnect_admission_cap: int = 0
+    recovery_complete_samples: int = 3
+    guard_bytes: int = 0
+    guard_ratio: float = 0.0
+    immediate_sample_min_interval_ms: int = 100
+    fail_closed_on_disconnect: bool = True
 
     def __post_init__(self) -> None:
         if self.min_num_seqs < 1:
@@ -38,6 +48,22 @@ class DynamicHBMConfig:
             raise ValueError("dynamic_hbm.scale_down_ratio must be between 0 and 1")
         if self.scale_up_stable_samples < 1:
             raise ValueError("dynamic_hbm.scale_up_stable_samples must be at least 1")
+        if self.critical_admission_cap < 0:
+            raise ValueError("dynamic_hbm.critical_admission_cap must be non-negative")
+        if self.critical_admission_cap > self.min_num_seqs:
+            raise ValueError("dynamic_hbm.critical_admission_cap must not exceed min_num_seqs")
+        if self.disconnect_admission_cap < 0:
+            raise ValueError("dynamic_hbm.disconnect_admission_cap must be non-negative")
+        if self.disconnect_admission_cap > self.min_num_seqs:
+            raise ValueError("dynamic_hbm.disconnect_admission_cap must not exceed min_num_seqs")
+        if self.recovery_complete_samples < 1:
+            raise ValueError("dynamic_hbm.recovery_complete_samples must be at least 1")
+        if self.guard_bytes < 0:
+            raise ValueError("dynamic_hbm.guard_bytes must be non-negative")
+        if not 0 <= self.guard_ratio < 1:
+            raise ValueError("dynamic_hbm.guard_ratio must be in [0, 1)")
+        if self.immediate_sample_min_interval_ms < 1:
+            raise ValueError("dynamic_hbm.immediate_sample_min_interval_ms must be positive")
 
     @classmethod
     def from_value(cls, value: DynamicHBMConfig | dict[str, Any] | None) -> DynamicHBMConfig:

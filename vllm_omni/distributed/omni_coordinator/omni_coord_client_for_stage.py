@@ -12,7 +12,7 @@ from dataclasses import asdict
 
 import zmq
 
-from .messages import BudgetDecisionEvent, ReplicaEvent, ReplicaStatus
+from .messages import BudgetAppliedEvent, BudgetDecisionEvent, ReplicaEvent, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +235,33 @@ class OmniCoordClientForStage:
                 except (TypeError, ValueError):
                     logger.warning("Dropping malformed budget decision: %r", data)
         return decisions
+
+    def send_budget_applied(
+        self,
+        *,
+        decision_generation: int,
+        applied_safety_cap: int,
+        effective_cap: int,
+        occupied_slots: int,
+        applied_monotonic_s: float,
+    ) -> None:
+        """Acknowledge a decision after it is applied on the scheduler thread."""
+        event = BudgetAppliedEvent(
+            message_type="budget_applied",
+            input_addr=self._input_addr,
+            stage_id=self._stage_id,
+            replica_id=self._replica_id,
+            instance_id=self._instance_id,
+            decision_generation=decision_generation,
+            applied_safety_cap=applied_safety_cap,
+            effective_cap=effective_cap,
+            occupied_slots=occupied_slots,
+            applied_monotonic_s=applied_monotonic_s,
+        )
+        with self._send_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("Client is closing or already closed")
+            self._socket.send(json.dumps(asdict(event)).encode("utf-8"), flags=zmq.NOBLOCK)
 
     def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat events while the client is alive."""

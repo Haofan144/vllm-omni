@@ -59,6 +59,27 @@ class BudgetDecisionEvent:
     effective_max_num_seqs: int
     pressure: float
     reason: str
+    safety_state: str = "normal"
+    pressure_source: str = "none"
+    physical_hbm_pressure: float = 0.0
+    kv_pressure: float = 0.0
+    report_age_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class BudgetAppliedEvent:
+    """Scheduler acknowledgement that a safety decision became effective."""
+
+    message_type: str
+    input_addr: str
+    stage_id: int
+    replica_id: int
+    instance_id: str
+    decision_generation: int
+    applied_safety_cap: int
+    effective_cap: int
+    occupied_slots: int
+    applied_monotonic_s: float
 
 
 @dataclass

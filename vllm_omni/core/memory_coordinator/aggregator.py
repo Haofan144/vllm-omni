@@ -25,6 +25,8 @@ class ReplicaMemoryAggregator:
         running_requests: int,
         waiting_requests: int,
         configured_max_num_seqs: int,
+        report_generation: int = 0,
+        trigger_reason: str = "periodic",
     ) -> ReplicaMemoryReport:
         by_rank: dict[int, RankMemoryReport] = {}
         for report in rank_reports:
@@ -49,4 +51,6 @@ class ReplicaMemoryAggregator:
             running_requests=running_requests,
             waiting_requests=waiting_requests,
             configured_max_num_seqs=configured_max_num_seqs,
+            report_generation=report_generation,
+            trigger_reason=trigger_reason,
         )

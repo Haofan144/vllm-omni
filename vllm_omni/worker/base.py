@@ -48,6 +48,26 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def capture_rank_memory_baseline(self) -> dict[str, int]:
+        """Capture stable resident HBM after worker initialization.
+
+        The engine invokes this before normal request admission. Keeping this
+        explicit avoids treating the first periodic sample (which may already
+        contain request allocations) as resident memory.
+        """
+        current_omni_platform.synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        generation = int(getattr(self, "_rank_memory_baseline_generation", 0)) + 1
+        baseline = {
+            "generation": generation,
+            "device_used_bytes": total_bytes - free_bytes,
+            "process_allocated_bytes": torch.cuda.memory_allocated(self.device),
+            "process_reserved_bytes": torch.cuda.memory_reserved(self.device),
+        }
+        self._rank_memory_baseline_generation = generation
+        self._rank_memory_baseline = baseline
+        return baseline
+
     def report_rank_memory(self) -> dict[str, int | float]:
         """Return a serializable memory snapshot for this worker's GPU rank."""
         reporter = getattr(self, "_rank_memory_reporter", None)
@@ -65,6 +85,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     torch.cuda.memory_allocated(self.device),
                     torch.cuda.memory_reserved(self.device),
                 ),
+                baseline_provider=lambda: getattr(self, "_rank_memory_baseline", None),
                 node_id=socket.gethostname(),
                 device_uuid=str(getattr(torch.cuda.get_device_properties(self.device), "uuid", "")),
             )
@@ -250,6 +271,8 @@ class OmniGPUWorkerBase(GPUWorker):
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
+        if hasattr(self, "_rank_memory_baseline"):
+            self.capture_rank_memory_baseline()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 

@@ -65,12 +65,18 @@ def test_critical_kv_pressure_immediately_uses_minimum() -> None:
 
     decision = allocator.allocate(_report(kv_pressure=0.96))
 
-    assert decision.effective_max_num_seqs == 2
+    assert decision.effective_max_num_seqs == 0
     assert decision.reason == "critical_pressure"
+    assert decision.safety_state == "critical"
+    assert decision.pressure_source == "kv"
 
 
 def test_additive_increase_requires_stable_low_pressure() -> None:
-    config = DynamicHBMConfig(enabled=True, scale_up_stable_samples=3)
+    config = DynamicHBMConfig(
+        enabled=True,
+        scale_up_stable_samples=3,
+        recovery_complete_samples=1,
+    )
     allocator = BudgetAllocator(config, 8)
     allocator.allocate(_report(hbm_pressures=(0.91,), cap=16))
     assert allocator.current_cap == 4
@@ -78,11 +84,13 @@ def test_additive_increase_requires_stable_low_pressure() -> None:
     first = allocator.allocate(_report(cap=16))
     second = allocator.allocate(_report(cap=16))
     third = allocator.allocate(_report(cap=16))
+    fourth = allocator.allocate(_report(cap=16))
 
     assert first.effective_max_num_seqs == 4
     assert second.effective_max_num_seqs == 4
-    assert third.effective_max_num_seqs == 5
-    assert third.reason == "stable_headroom"
+    assert third.effective_max_num_seqs == 4
+    assert fourth.effective_max_num_seqs == 5
+    assert fourth.reason == "stable_headroom"
 
 
 def test_incomplete_rank_reports_hold_then_decrease() -> None:
@@ -117,6 +125,10 @@ def test_hysteresis_holds_current_cap() -> None:
         {"report_timeout_ms": 100, "sample_interval_ms": 500},
         {"missing_report_grace_samples": -1},
         {"min_num_seqs": 0},
+        {"critical_admission_cap": -1},
+        {"min_num_seqs": 1, "critical_admission_cap": 2},
+        {"min_num_seqs": 1, "disconnect_admission_cap": 2},
+        {"guard_ratio": 1.0},
     ],
 )
 def test_dynamic_hbm_config_rejects_invalid_values(value) -> None:

@@ -15,6 +15,12 @@ def test_rank_memory_reporter_collects_worker_device_snapshot() -> None:
         device_id=7,
         device_memory_provider=lambda: (200, 1000),
         process_memory_provider=lambda: (300, 400),
+        baseline_provider=lambda: {
+            "generation": 2,
+            "device_used_bytes": 700,
+            "process_allocated_bytes": 200,
+            "process_reserved_bytes": 250,
+        },
         clock=lambda: 123.5,
     )
 
@@ -27,4 +33,7 @@ def test_rank_memory_reporter_collects_worker_device_snapshot() -> None:
     assert report.timestamp_monotonic_s == 123.5
     assert report.process_allocated_bytes == 300
     assert report.process_reserved_bytes == 400
+    assert report.baseline_complete
+    assert report.baseline_generation == 2
+    assert report.dynamic_process_reserved_bytes == 150
     assert report.hbm_pressure == pytest.approx(0.8)

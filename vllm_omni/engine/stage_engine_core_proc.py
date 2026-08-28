@@ -64,6 +64,38 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 
+    def _initialize_dynamic_hbm_monitoring(self) -> None:
+        """Capture resident baselines before normal request admission begins."""
+        config = getattr(self.scheduler, "_dynamic_hbm_config", None)
+        if config is None or not config.enabled:
+            return
+        try:
+            baselines = self.model_executor.collective_rpc(
+                "capture_rank_memory_baseline",
+                timeout=config.report_timeout_ms / 1000,
+            )
+            if not baselines or any(baseline is None for baseline in baselines):
+                logger.warning("[HBMCoordinator] resident baseline is incomplete")
+        except Exception:
+            # Physical free-HBM safety remains valid without attribution, but
+            # baseline-dependent observability must report itself incomplete.
+            logger.exception("[HBMCoordinator] failed to capture resident HBM baseline")
+
+    def request_dynamic_hbm_sample(self, reason: str) -> None:
+        """Request a rate-limited sample before the next normal interval."""
+        self._dynamic_hbm_pending_trigger_reason = reason or "manual"
+
+    def _maybe_apply_local_kv_safety(self) -> None:
+        config = getattr(self.scheduler, "_dynamic_hbm_config", None)
+        if config is None or not config.enabled:
+            return
+        kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
+        if not kv_cache_config or not kv_cache_config.kv_cache_groups:
+            return
+        if self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0:
+            self.scheduler.apply_dynamic_hbm_local_kv_guard()
+            self.request_dynamic_hbm_sample("kv_exhausted")
+
     def _maybe_start_dynamic_hbm_report(self) -> None:
         config = getattr(self.scheduler, "_dynamic_hbm_config", None)
         if config is None or not config.enabled:
@@ -73,8 +105,16 @@ class StageEngineCoreProc(EngineCoreProc):
             return
         now = time.monotonic()
         last_sample = getattr(self, "_dynamic_hbm_last_sample_s", float("-inf"))
-        if now - last_sample < config.sample_interval_ms / 1000:
+        trigger_reason = getattr(self, "_dynamic_hbm_pending_trigger_reason", None)
+        interval_ms = (
+            config.immediate_sample_min_interval_ms
+            if trigger_reason is not None
+            else config.sample_interval_ms
+        )
+        if now - last_sample < interval_ms / 1000:
             return
+        self._dynamic_hbm_pending_trigger_reason = None
+        self._dynamic_hbm_active_trigger_reason = trigger_reason or "periodic"
         self._dynamic_hbm_last_sample_s = now
         self._dynamic_hbm_report_started_s = now
 
@@ -136,7 +176,10 @@ class StageEngineCoreProc(EngineCoreProc):
             running_requests=len(self.scheduler.running),
             waiting_requests=len(self.scheduler.waiting),
             configured_max_num_seqs=self.scheduler._configured_max_num_seqs,
+            report_generation=getattr(self, "_dynamic_hbm_report_sequence", 0) + 1,
+            trigger_reason=getattr(self, "_dynamic_hbm_active_trigger_reason", "periodic"),
         )
+        self._dynamic_hbm_report_sequence = report.report_generation
         coord_client = getattr(self, "_dynamic_hbm_coord_client", None)
         if coord_client is None:
             # Standalone EngineCore remains backward compatible.
@@ -154,6 +197,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 )
         except Exception:
             logger.exception("[HBMCoordinator] failed to send central memory report")
+            self.scheduler.apply_dynamic_hbm_disconnect_guard()
 
     def _apply_dynamic_hbm_decisions(self) -> None:
         client = getattr(self, "_dynamic_hbm_coord_client", None)
@@ -163,21 +207,42 @@ class StageEngineCoreProc(EngineCoreProc):
             decisions = client.poll_budget_decisions()
         except Exception:
             logger.exception("[HBMCoordinator] failed to receive central budget decisions")
+            self.scheduler.apply_dynamic_hbm_disconnect_guard()
             return
         for decision in decisions:
             if decision.instance_id != client._instance_id:
                 continue
             if decision.stage_id != client._stage_id or decision.replica_id != client._replica_id:
                 continue
-            self.scheduler.apply_stage_budget_decision(
+            applied = self.scheduler.apply_stage_budget_decision(
                 generation=decision.decision_generation,
                 effective_max_num_seqs=decision.effective_max_num_seqs,
                 pressure=decision.pressure,
                 reason=decision.reason,
                 based_on_report_generation=decision.based_on_report_generation,
+                safety_state=decision.safety_state,
+                pressure_source=decision.pressure_source,
             )
+            if not applied:
+                continue
+            try:
+                client.send_budget_applied(
+                    decision_generation=decision.decision_generation,
+                    applied_safety_cap=self.scheduler._safety_max_num_seqs,
+                    effective_cap=self.scheduler._effective_max_num_seqs,
+                    occupied_slots=(
+                        len(self.scheduler.running)
+                        + getattr(self.scheduler, "num_waiting_for_streaming_input", 0)
+                    ),
+                    applied_monotonic_s=time.monotonic(),
+                )
+            except Exception:
+                # The cap is already active locally; ACK transport failure
+                # must never roll it back.
+                logger.exception("[HBMCoordinator] failed to acknowledge central budget decision")
 
     def step(self):
+        self._maybe_apply_local_kv_safety()
         self._apply_dynamic_hbm_decisions()
         self._maybe_finish_dynamic_hbm_report()
         self._maybe_start_dynamic_hbm_report()
@@ -186,6 +251,7 @@ class StageEngineCoreProc(EngineCoreProc):
         return result
 
     def step_with_batch_queue(self):
+        self._maybe_apply_local_kv_safety()
         self._apply_dynamic_hbm_decisions()
         self._maybe_finish_dynamic_hbm_report()
         self._maybe_start_dynamic_hbm_report()
@@ -276,6 +342,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_index=dp_rank,
                 **kwargs,
             )
+            engine_core._initialize_dynamic_hbm_monitoring()
 
             # Each subprocess corresponds to exactly one omni replica with
             # its own OmniMasterServer allocation, so the heartbeat client

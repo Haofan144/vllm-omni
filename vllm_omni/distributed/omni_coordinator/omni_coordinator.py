@@ -18,7 +18,7 @@ from vllm_omni.core.memory_coordinator import (
     ReplicaMemoryReport,
 )
 
-from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
+from .messages import BudgetAppliedEvent, ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,9 @@ class OmniCoordinator:
         self._memory_received_at: dict[str, float] = {}
         self._last_allocation_at: dict[str, float] = {}
         self._last_pressures: dict[str, float] = {}
+        self._last_applied_decisions: dict[str, BudgetAppliedEvent] = {}
+        self._decision_sent_at: dict[tuple[str, int], float] = {}
+        self._decision_apply_latency_ms: dict[str, float] = {}
         self._lock = threading.Lock()
         self._pub_lock = threading.Lock()
 
@@ -172,6 +175,10 @@ class OmniCoordinator:
         self._memory_received_at.pop(input_addr, None)
         self._last_allocation_at.pop(input_addr, None)
         self._last_pressures.pop(input_addr, None)
+        self._last_applied_decisions.pop(input_addr, None)
+        self._decision_apply_latency_ms.pop(input_addr, None)
+        for key in [key for key in self._decision_sent_at if key[0] == input_addr]:
+            self._decision_sent_at.pop(key, None)
 
     def _check_heartbeat_timeouts(self) -> None:
         """Mark replicas as ERROR if their heartbeat has timed out."""
@@ -275,6 +282,9 @@ class OmniCoordinator:
             if data.get("message_type") == "memory_report":
                 self._handle_memory_report(data, routing_identity)
                 continue
+            if data.get("message_type") == "budget_applied":
+                self._handle_budget_applied(data)
+                continue
 
             event = self._parse_replica_event(data)
             if event is None:
@@ -283,6 +293,28 @@ class OmniCoordinator:
 
             self._stage_routes[event.input_addr] = routing_identity
             self._handle_event(event)
+
+    def _handle_budget_applied(self, data: dict[str, Any]) -> None:
+        try:
+            event = BudgetAppliedEvent(**data)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Dropping malformed HBM budget ACK: %s", exc)
+            return
+        with self._lock:
+            registered = self._replicas.get(event.input_addr)
+            if registered is None or registered.instance_id != event.instance_id:
+                return
+            previous = self._last_applied_decisions.get(event.input_addr)
+            if previous is not None and event.decision_generation <= previous.decision_generation:
+                return
+            sent_at = self._decision_sent_at.get((event.input_addr, event.decision_generation))
+            if sent_at is None:
+                # Do not let a fabricated or out-of-window ACK advance the
+                # applied generation. Only decisions emitted by this live
+                # coordinator instance are acknowledgeable.
+                return
+            self._decision_apply_latency_ms[event.input_addr] = max(0.0, (time() - sent_at) * 1000)
+            self._last_applied_decisions[event.input_addr] = event
 
     @staticmethod
     def _device_keys(report: ReplicaMemoryReport) -> set[tuple[str, str]]:
@@ -358,16 +390,24 @@ class OmniCoordinator:
         ]
         # Device HBM is shared; KV blocks are private to a stage replica and
         # must not throttle unrelated consumers on the same physical GPU.
-        shared_hbm_pressure = max(self._memory_reports[addr].hbm_pressure for addr in affected)
+        # Apply each consumer's safety guard to all reports for its shared
+        # devices so a stricter stage policy cannot be bypassed by a peer.
         for addr in affected:
             candidate = self._memory_reports[addr]
             allocator = self._budget_allocators.get(addr)
             route = self._stage_routes.get(addr)
             if allocator is None or route is None:
                 continue
+            candidate_config = self._memory_configs[addr]
+            shared_hbm_pressure = max(
+                self._memory_reports[shared_addr].hbm_pressure_with_guard(
+                    guard_bytes=candidate_config.guard_bytes,
+                    guard_ratio=candidate_config.guard_ratio,
+                )
+                for shared_addr in affected
+            )
             effective_pressure = max(shared_hbm_pressure, candidate.kv_pressure)
             now = time()
-            candidate_config = self._memory_configs[addr]
             due = now - self._last_allocation_at.get(addr, 0.0) >= candidate_config.sample_interval_ms / 1000
             pressure_crossing = (
                 effective_pressure >= candidate_config.high_watermark
@@ -394,12 +434,22 @@ class OmniCoordinator:
                 "effective_max_num_seqs": decision.effective_max_num_seqs,
                 "pressure": effective_pressure,
                 "reason": reason,
+                "safety_state": decision.safety_state,
+                "pressure_source": (
+                    "shared_physical_hbm"
+                    if shared_hbm_pressure >= candidate.kv_pressure
+                    else "kv"
+                ),
+                "physical_hbm_pressure": shared_hbm_pressure,
+                "kv_pressure": candidate.kv_pressure,
+                "report_age_ms": max(0.0, (now - self._memory_received_at[addr]) * 1000),
             }
             try:
                 self._router.send_multipart([route, json.dumps(wire).encode("utf-8")], flags=zmq.NOBLOCK)
             except (zmq.Again, zmq.ZMQError):
                 logger.warning("Dropping HBM budget decision for %s", addr)
             else:
+                self._decision_sent_at[(addr, generation)] = time()
                 previous_cap = self._last_caps.get(addr)
                 previous_reason = self._last_reasons.get(addr)
                 self._last_caps[addr] = decision.effective_max_num_seqs
@@ -463,11 +513,18 @@ class OmniCoordinator:
                 "effective_max_num_seqs": decision.effective_max_num_seqs,
                 "pressure": config.high_watermark,
                 "reason": f"stale_report_{decision.reason}",
+                "safety_state": "stale",
+                "pressure_source": "telemetry_health",
+                "physical_hbm_pressure": 1.0,
+                "kv_pressure": report.kv_pressure,
+                "report_age_ms": max(0.0, (now - received_at) * 1000),
             }
             try:
                 self._router.send_multipart([route, json.dumps(wire).encode("utf-8")], flags=zmq.NOBLOCK)
             except (zmq.Again, zmq.ZMQError):
                 logger.warning("Dropping stale-report HBM decision for %s", addr)
+            else:
+                self._decision_sent_at[(addr, generation)] = time()
 
     def _periodic_loop(self) -> None:
         """Periodic loop to check heartbeat timeouts and flush broadcasts.

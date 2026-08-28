@@ -138,7 +138,7 @@ def test_generation_scheduler_applies_dynamic_hbm_cap_without_evicting_running_r
 
     assert sched._effective_max_num_seqs == 4
     assert sched._dynamic_max_num_running_reqs() == 5
-    assert sched._effective_max_num_scheduled_tokens == 1024
+    assert sched._effective_max_num_scheduled_tokens == 1280
 
 
 def test_central_budget_decision_rejects_stale_generation() -> None:
@@ -180,9 +180,13 @@ def test_central_budget_scales_token_budget_and_rejects_stale_report() -> None:
         effective_max_num_seqs=4,
         pressure=0.96,
         reason="critical_pressure",
+        safety_state="critical",
+        pressure_source="physical_hbm",
     )
-    assert sched._effective_max_num_scheduled_tokens == 1024
+    assert sched._effective_max_num_scheduled_tokens == 1
     assert sched._dynamic_hbm_critical
+    assert sched._safety_max_num_seqs == 0
+    assert sched._effective_max_num_seqs == 0
     assert not sched.apply_stage_budget_decision(
         generation=2,
         based_on_report_generation=4,
@@ -190,7 +194,7 @@ def test_central_budget_scales_token_budget_and_rejects_stale_report() -> None:
         pressure=0.5,
         reason="stale_report",
     )
-    assert sched._effective_max_num_seqs == 4
+    assert sched._effective_max_num_seqs == 0
 
 
 def _make_request() -> Request:

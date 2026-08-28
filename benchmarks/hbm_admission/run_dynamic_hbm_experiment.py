@@ -138,6 +138,13 @@ def prepare_config(args: argparse.Namespace, arm: Arm, case_dir: Path) -> Path:
         stage["dynamic_hbm"] = {
             "enabled": arm.dynamic,
             "min_num_seqs": min(args.min_num_seqs, effective_cap),
+            "critical_admission_cap": min(args.critical_admission_cap, effective_cap),
+            "disconnect_admission_cap": min(args.disconnect_admission_cap, effective_cap),
+            "recovery_complete_samples": args.recovery_complete_samples,
+            "guard_bytes": args.guard_mib * 1024**2,
+            "guard_ratio": args.guard_ratio,
+            "immediate_sample_min_interval_ms": args.immediate_sample_min_interval_ms,
+            "fail_closed_on_disconnect": args.fail_closed_on_disconnect,
             "sample_interval_ms": args.sample_interval_ms,
             "report_timeout_ms": args.report_timeout_ms,
             "missing_report_grace_samples": args.missing_report_grace_samples,
@@ -329,6 +336,25 @@ def start_pressure(args: argparse.Namespace, path: Path) -> tuple[subprocess.Pop
     )
 
 
+def wait_for_benchmark_response(
+    proc: subprocess.Popen,
+    server_log: Path,
+    start_offset: int,
+    timeout: int,
+) -> None:
+    """Wait until the benchmark has completed its first HTTP warmup request."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"benchmark exited with {proc.returncode} before its first HTTP response")
+        with server_log.open("rb") as handle:
+            handle.seek(start_offset)
+            if b'"POST ' in handle.read():
+                return
+        time.sleep(0.5)
+    raise TimeoutError("benchmark did not produce an HTTP response before pressure trigger timeout")
+
+
 def parse_gpu_csv(path: Path) -> dict[str, Any]:
     used: list[float] = []
     pressure: list[float] = []
@@ -483,7 +509,7 @@ def evaluate_case_acceptance(
     scheduler: dict[str, Any],
     pressure: dict[str, Any],
     expected_stage_ids: set[int],
-    min_num_seqs: int,
+    expected_pressure_cap: int,
     execution_succeeded: bool,
 ) -> dict[str, Any]:
     checks: dict[str, bool] = {
@@ -508,7 +534,9 @@ def evaluate_case_acceptance(
         checks["all_stages_received_shared_device_decisions"] = all(
             per_stage.get(str(stage_id), {}).get("shared_device_decisions", 0) > 0 for stage_id in expected_stage_ids
         )
-        checks["minimum_cap_reached"] = scheduler.get("minimum_observed_cap") == min_num_seqs
+        checks["critical_admission_cap_reached"] = (
+            scheduler.get("minimum_observed_cap") == expected_pressure_cap
+        )
         checks["no_server_oom"] = scheduler.get("oom_mentions", 0) == 0
         checks["no_server_traceback"] = scheduler.get("traceback_mentions", 0) == 0
     return {"passed": all(checks.values()), "checks": checks}
@@ -575,6 +603,12 @@ def analyze_summary(summary: dict[str, Any], metric_map: dict[str, str]) -> dict
                 ),
                 None,
             ),
+            "dynamic_vs_static_pressure_throughput_ratio_D_over_C": ratio(
+                "D_dynamic_on_pressure", "C_dynamic_off_pressure", "throughput"
+            ),
+            "dynamic_vs_static_pressure_p99_latency_ratio_D_over_C": ratio(
+                "D_dynamic_on_pressure", "C_dynamic_off_pressure", "p99_latency_ms"
+            ),
         },
         "safety": {
             "dynamic_pressure_completed_runs": len(dynamic_pressure_cases),
@@ -615,36 +649,50 @@ def run_case(args: argparse.Namespace, arm: Arm, repeat: int) -> dict[str, Any]:
         "artifacts": {"deploy": str(deploy), "server_log": str(server_log), "gpu_csv": str(gpu_csv)},
     }
     write_json(status_path, status)
-    server = monitor = pressure = None
+    server = monitor = pressure = client = None
     server_file = monitor_file = pressure_file = None
     try:
         wait_gpu_release(args.device, args.release_threshold_mib)
         server, server_file = start_server(args, deploy, server_log)
         monitor, monitor_file = start_gpu_monitor(args.device, gpu_csv)
-        if arm.pressure:
-            pressure, pressure_file = start_pressure(args, pressure_log)
         command = benchmark_command(args, result_json)
         status["benchmark_command"] = command
         with client_log.open("w") as output:
-            completed = subprocess.run(
+            trigger_offset = server_log.stat().st_size
+            client = subprocess.Popen(
                 command,
                 cwd=REPO,
                 env={**os.environ, "PYTHONPATH": str(REPO)},
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=args.benchmark_timeout,
+                start_new_session=True,
             )
-        status["benchmark_exit_code"] = completed.returncode
+            if arm.pressure:
+                if args.pressure_trigger_mode == "first-response":
+                    wait_for_benchmark_response(
+                        client,
+                        server_log,
+                        trigger_offset,
+                        args.pressure_trigger_timeout,
+                    )
+                pressure, pressure_file = start_pressure(args, pressure_log)
+            try:
+                client.wait(timeout=args.benchmark_timeout)
+            except subprocess.TimeoutExpired:
+                stop_group(client, timeout=5)
+                raise
+        status["benchmark_exit_code"] = client.returncode
         if pressure is not None:
             try:
                 pressure.wait(timeout=args.pressure_wait_timeout)
             except subprocess.TimeoutExpired:
                 stop_group(pressure, timeout=5)
-        status["status"] = "completed" if completed.returncode == 0 and result_json.exists() else "failed"
+        status["status"] = "completed" if client.returncode == 0 and result_json.exists() else "failed"
     except Exception as exc:
         status.update(status="failed", error=f"{type(exc).__name__}: {exc}")
     finally:
+        stop_group(client, timeout=5)
         stop_group(pressure, timeout=5)
         if pressure_file is not None:
             pressure_file.close()
@@ -675,7 +723,7 @@ def run_case(args: argparse.Namespace, arm: Arm, repeat: int) -> dict[str, Any]:
         status["scheduler"],
         status["pressure"],
         expected_stage_ids,
-        min(args.min_num_seqs, arm.fixed_cap or args.max_num_seqs),
+        min(args.critical_admission_cap, arm.fixed_cap or args.max_num_seqs),
         status["status"] == "completed",
     )
     if status["status"] == "completed" and not status["acceptance"]["passed"]:
@@ -747,6 +795,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic-stage-ids", type=int, nargs="+")
     parser.add_argument("--include-fixed-cap", type=int, metavar="CAP")
     parser.add_argument("--min-num-seqs", type=int, default=2)
+    parser.add_argument("--critical-admission-cap", type=int, default=0)
+    parser.add_argument("--disconnect-admission-cap", type=int, default=0)
+    parser.add_argument("--recovery-complete-samples", type=int, default=3)
+    parser.add_argument("--guard-mib", type=int, default=0)
+    parser.add_argument("--guard-ratio", type=float, default=0.0)
+    parser.add_argument("--immediate-sample-min-interval-ms", type=int, default=100)
+    parser.add_argument(
+        "--fail-closed-on-disconnect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--sample-interval-ms", type=int, default=500)
     parser.add_argument("--report-timeout-ms", type=int, default=1500)
     parser.add_argument("--missing-report-grace-samples", type=int, default=1)
@@ -764,6 +823,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pressure-recovery-target", type=float, default=0.78)
     parser.add_argument("--pressure-recovery-seconds", type=float, default=20)
     parser.add_argument("--pressure-post-release-seconds", type=float, default=45)
+    parser.add_argument(
+        "--pressure-trigger-mode",
+        choices=("immediate", "first-response"),
+        default="immediate",
+        help="start the sidecar immediately or after the first benchmark HTTP response",
+    )
+    parser.add_argument("--pressure-trigger-timeout", type=int, default=600)
     parser.add_argument("--pressure-chunk-mib", type=int, default=128)
     parser.add_argument("--pressure-reserve-mib", type=int, default=1536)
     parser.add_argument("--pressure-wait-timeout", type=int, default=180)
@@ -779,6 +845,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("watermarks must satisfy 0 < low < high < critical < 1")
     if args.min_num_seqs > args.max_num_seqs:
         parser.error("min-num-seqs must not exceed max-num-seqs")
+    if not 0 <= args.critical_admission_cap <= args.min_num_seqs:
+        parser.error("critical-admission-cap must be in [0, min-num-seqs]")
+    if not 0 <= args.disconnect_admission_cap <= args.min_num_seqs:
+        parser.error("disconnect-admission-cap must be in [0, min-num-seqs]")
+    if args.recovery_complete_samples < 1:
+        parser.error("recovery-complete-samples must be at least 1")
+    if args.guard_mib < 0:
+        parser.error("guard-mib must be non-negative")
+    if not 0 <= args.guard_ratio < 1:
+        parser.error("guard-ratio must be in [0, 1)")
+    if args.immediate_sample_min_interval_ms < 1:
+        parser.error("immediate-sample-min-interval-ms must be positive")
     return args
 
 
