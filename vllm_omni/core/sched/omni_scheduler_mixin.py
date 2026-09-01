@@ -463,8 +463,20 @@ class OmniSchedulerMixin:
             num_computed_tokens=max(0, int(getattr(request, "num_computed_tokens", 0))),
             num_generated_tokens=max(0, int(generated)),
             allocated_kv_blocks=self._get_request_allocated_kv_blocks(request),
-            # Exact prefix reuse is owned by KVCacheManager. Until a read-only
-            # query is exposed here, zero is the explicit conservative value.
+            # Prefix-cache hits are only known for a request vLLM's own
+            # scheduler has actually scheduled: they are computed by
+            # KVCacheManager.get_computed_blocks (populating
+            # request.prefill_stats), which has side effects — it creates
+            # block references and, in "full" KV-event mode, emits
+            # BlockStored events — and is meant to run at most once per
+            # prefill. This admission check runs on the still-waiting
+            # head-of-line request *before* that scheduling step, so there is
+            # no side-effect-free way to look up the real hit count here
+            # without duplicating KVCacheCoordinator.find_longest_cache_hit's
+            # internal (and cache/config-version-fragile) prefix-hash walk.
+            # Zero is therefore a structural lower bound on reuse, not a
+            # placeholder pending a follow-up: it only ever overestimates a
+            # request's new-token KV cost, never underestimates it.
             reusable_cached_tokens=0,
             next_scheduled_tokens=max(
                 1,

@@ -177,3 +177,26 @@ def test_resource_admission_off_is_noop() -> None:
     decision = scheduler._dynamic_hbm_resource_admission_decision()
     assert decision.allowed
     assert decision.reason.value == "disabled"
+
+
+class _WaitingRequestWithStalePrefillStats(_WaitingRequest):
+    """A still-waiting request that already carries a populated
+    ``prefill_stats`` (e.g. left over from a prior preemption). Real
+    prefix-cache hits for the *next* scheduling attempt are only computed by
+    ``KVCacheManager.get_computed_blocks`` when vLLM's own scheduler actually
+    schedules the request — a side-effecting call this pre-scheduling
+    admission check must not trigger. This value must never be read as if it
+    reflected the upcoming attempt's reuse."""
+
+    prefill_stats = SimpleNamespace(
+        num_local_cached_tokens=48, num_external_cached_tokens=16
+    )
+
+
+def test_resource_context_ignores_prefill_stats_before_real_scheduling() -> None:
+    scheduler = _resource_scheduler("shadow", free_blocks=1_000)
+    request = _WaitingRequestWithStalePrefillStats()
+    scheduler.waiting = [request]
+    context = scheduler._ar_resource_context(request)
+    assert context is not None
+    assert context.reusable_cached_tokens == 0
