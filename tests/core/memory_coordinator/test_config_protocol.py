@@ -59,6 +59,34 @@ def test_dynamic_hbm_rejects_invalid_m1_config(value) -> None:
         DynamicHBMConfig.from_value(value)
 
 
+def test_dynamic_hbm_rejects_unknown_resource_admission_mode() -> None:
+    with pytest.raises(ValueError, match="resource_admission_mode"):
+        DynamicHBMConfig.from_value(
+            {"enabled": True, "resource_admission_mode": "production"}
+        )
+
+
+def test_resource_profile_path_requires_device_fingerprint() -> None:
+    with pytest.raises(ValueError, match="resource_profile_device_type"):
+        DynamicHBMConfig.from_value(
+            {"enabled": True, "resource_profile_path": "profile.jsonl"}
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"resource_target_coverage": 0.0},
+        {"resource_target_coverage": 1.1},
+        {"resource_profile_min_samples": 0},
+        {"resource_observation_flush_size": 0},
+    ],
+)
+def test_resource_profile_config_rejects_invalid_values(value) -> None:
+    with pytest.raises(ValueError, match="dynamic_hbm"):
+        DynamicHBMConfig.from_value(value)
+
+
 def test_rank_report_separates_raw_guarded_and_unattributed_memory() -> None:
     rank = _rank(
         baseline_generation=1,

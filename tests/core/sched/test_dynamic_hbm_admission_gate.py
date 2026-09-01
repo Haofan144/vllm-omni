@@ -129,3 +129,51 @@ def test_token_scaling_can_be_disabled() -> None:
     scheduler = _Scheduler(config={"enabled": True, "scale_token_budget": False})
     _apply(scheduler, generation=1, cap=4, state=SafetyState.HIGH_PRESSURE)
     assert scheduler._effective_max_num_scheduled_tokens == 4096
+
+
+class _BlockPool:
+    def __init__(self, free_blocks: int):
+        self.free_blocks = free_blocks
+
+    def get_num_free_blocks(self) -> int:
+        return self.free_blocks
+
+
+class _WaitingRequest:
+    request_id = "request-0"
+    num_prompt_tokens = 64
+    max_tokens = 32
+    num_computed_tokens = 0
+    num_output_tokens = 0
+
+
+def _resource_scheduler(mode: str, free_blocks: int) -> _Scheduler:
+    scheduler = _Scheduler(
+        config={"enabled": True, "resource_admission_mode": mode},
+    )
+    scheduler.cache_config = SimpleNamespace(block_size=16)
+    scheduler.kv_cache_manager = SimpleNamespace(block_pool=_BlockPool(free_blocks))
+    scheduler.waiting = [_WaitingRequest()]
+    return scheduler
+
+
+def test_resource_admission_defaults_to_shadow() -> None:
+    scheduler = _resource_scheduler("shadow", free_blocks=2)
+    decision = scheduler._dynamic_hbm_resource_admission_decision()
+    assert decision.allowed
+    assert decision.shadow_would_defer
+    assert scheduler._resource_admission_counts["shadow_would_defer"] == 1
+
+
+def test_resource_admission_can_be_explicitly_enforced() -> None:
+    scheduler = _resource_scheduler("enforce", free_blocks=2)
+    decision = scheduler._dynamic_hbm_resource_admission_decision()
+    assert not decision.allowed
+    assert decision.reason.value == "kv_peak_risk"
+
+
+def test_resource_admission_off_is_noop() -> None:
+    scheduler = _resource_scheduler("off", free_blocks=0)
+    decision = scheduler._dynamic_hbm_resource_admission_decision()
+    assert decision.allowed
+    assert decision.reason.value == "disabled"

@@ -30,6 +30,16 @@ class DynamicHBMConfig:
     guard_ratio: float = 0.0
     immediate_sample_min_interval_ms: int = 100
     fail_closed_on_disconnect: bool = True
+    # M2 resource estimator rollout. ``shadow`` records counterfactual
+    # resource decisions without changing scheduling; ``enforce`` applies the
+    # local AR KV decision. Global commitment remains a later milestone.
+    resource_admission_mode: str = "shadow"
+    resource_profile_path: str | None = None
+    resource_profile_device_type: str | None = None
+    resource_target_coverage: float = 0.95
+    resource_profile_min_samples: int = 20
+    resource_observation_path: str | None = None
+    resource_observation_flush_size: int = 1
 
     def __post_init__(self) -> None:
         if self.min_num_seqs < 1:
@@ -64,6 +74,27 @@ class DynamicHBMConfig:
             raise ValueError("dynamic_hbm.guard_ratio must be in [0, 1)")
         if self.immediate_sample_min_interval_ms < 1:
             raise ValueError("dynamic_hbm.immediate_sample_min_interval_ms must be positive")
+        if self.resource_admission_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError(
+                "dynamic_hbm.resource_admission_mode must be off, shadow, or enforce"
+            )
+        if not 0.0 < self.resource_target_coverage <= 1.0:
+            raise ValueError(
+                "dynamic_hbm.resource_target_coverage must be in (0, 1]"
+            )
+        if self.resource_profile_min_samples < 1:
+            raise ValueError(
+                "dynamic_hbm.resource_profile_min_samples must be positive"
+            )
+        if self.resource_profile_path and not self.resource_profile_device_type:
+            raise ValueError(
+                "dynamic_hbm.resource_profile_device_type is required with "
+                "resource_profile_path"
+            )
+        if self.resource_observation_flush_size < 1:
+            raise ValueError(
+                "dynamic_hbm.resource_observation_flush_size must be positive"
+            )
 
     @classmethod
     def from_value(cls, value: DynamicHBMConfig | dict[str, Any] | None) -> DynamicHBMConfig:

@@ -174,7 +174,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         enabled = getattr(self, "_hbm_admission_enabled", False)
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         static_guard_active = enabled and free_blocks == 0
-        dynamic_guard_active = not OmniSchedulerMixin._dynamic_hbm_allows_new_admission(self)
+        resource_decision = OmniSchedulerMixin._dynamic_hbm_resource_admission_decision(self)
+        dynamic_guard_active = not OmniSchedulerMixin._dynamic_hbm_allows_new_admission(
+            self
+        ) or not resource_decision.allowed
         should_defer = static_guard_active or dynamic_guard_active
         was_active = getattr(self, "_hbm_admission_was_active", False)
 
@@ -346,6 +349,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             include_cached_payloads=True,
         )
+        self._sample_resource_observations()
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -796,6 +800,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+
+        # Capture the final M2 shadow sample while this request's KV block
+        # table is still available. Normal completion does not pass through
+        # finish_requests(), so this lifecycle hook is required for real
+        # request traces.
+        self._finish_resource_observation(request)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.

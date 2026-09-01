@@ -57,10 +57,12 @@ def _make_finished_request(request_id: str = "req-1"):
 def test_free_request_releases_chunk_transfer_adapter_receiver_state():
     adapter = MagicMock()
     sched = _make_scheduler(chunk_transfer_adapter=adapter)
+    sched._finish_resource_observation = MagicMock()
     request = _make_finished_request("req-1")
 
     sched._free_request(request)
 
+    sched._finish_resource_observation.assert_called_once_with(request)
     adapter.cleanup_receiver.assert_called_once_with("req-1")
 
 

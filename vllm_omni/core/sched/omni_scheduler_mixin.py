@@ -26,10 +26,19 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.memory_coordinator import (
+    ARRequestResourceContext,
+    ARProfileStore,
+    ARWorkloadClassifier,
+    AdmissionDecision,
+    AdmissionReason,
     BudgetAllocator,
     DynamicHBMConfig,
     ReplicaMemoryReport,
+    ProfileFingerprint,
+    ResourceObservationCollector,
+    ResourceObservationJSONLWriter,
     SafetyState,
+    evaluate_ar_kv_admission,
 )
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -123,6 +132,35 @@ class OmniSchedulerMixin:
         self._last_budget_report_generation = 0
         self._dynamic_hbm_critical = False
         self._dynamic_hbm_safety_state = SafetyState.NORMAL
+        self._resource_admission_counts: dict[str, int] = {}
+        self._last_resource_admission_decision: AdmissionDecision | None = None
+        self._resource_observation_collector = ResourceObservationCollector()
+        self._ar_workload_classifier = ARWorkloadClassifier()
+        self._dynamic_hbm_ar_profile_store: ARProfileStore | None = None
+        self._dynamic_hbm_ar_profile_loaded = False
+        self._resource_observation_writer: ResourceObservationJSONLWriter | None = None
+        observation_path = self._dynamic_hbm_config.resource_observation_path
+        if observation_path:
+            stage_id = int(getattr(self.vllm_config.model_config, "stage_id", 0))
+            replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
+            values = {
+                "stage_id": stage_id,
+                "replica_id": replica_id,
+                "pid": os.getpid(),
+            }
+            if "{" in observation_path:
+                resolved_path = observation_path.format(**values)
+            else:
+                path = os.path.abspath(observation_path)
+                root, extension = os.path.splitext(path)
+                resolved_path = (
+                    f"{root}.stage-{stage_id}.replica-{replica_id}.pid-{os.getpid()}"
+                    f"{extension or '.jsonl'}"
+                )
+            self._resource_observation_writer = ResourceObservationJSONLWriter(
+                resolved_path,
+                flush_size=self._dynamic_hbm_config.resource_observation_flush_size,
+            )
         self._dynamic_hbm_allocator = (
             BudgetAllocator(self._dynamic_hbm_config, self._configured_max_num_seqs)
             if self._dynamic_hbm_config.enabled
@@ -307,6 +345,303 @@ class OmniSchedulerMixin:
             return True
         occupied_slots = len(self.running) + getattr(self, "num_waiting_for_streaming_input", 0)
         return occupied_slots < self._effective_max_num_seqs
+
+    def _ar_resource_estimator(self) -> Any:
+        """Lazily build (and cache) the AR KV-block estimator for this replica.
+
+        ``block_size`` mirrors the fallback chain already used by
+        ``OmniARScheduler._mark_request_for_kv_transfer`` (cache_config first,
+        then scheduler_config) since neither is guaranteed set at
+        ``_init_dynamic_hbm_scheduling_state`` time.
+        """
+        estimator = getattr(self, "_dynamic_hbm_ar_estimator", None)
+        if estimator is not None:
+            return estimator
+        block_size = None
+        cache_config = getattr(self, "cache_config", None)
+        if cache_config is not None and hasattr(cache_config, "block_size"):
+            block_size = cache_config.block_size
+        else:
+            scheduler_config = getattr(self, "scheduler_config", None)
+            if scheduler_config is not None and hasattr(scheduler_config, "block_size"):
+                block_size = scheduler_config.block_size
+        if not block_size:
+            return None
+        from vllm_omni.core.memory_coordinator import ARResourceEstimator
+
+        estimator = ARResourceEstimator(block_size)
+        self._dynamic_hbm_ar_estimator = estimator
+        return estimator
+
+    def _get_request_allocated_kv_blocks(self, request: Any) -> int:
+        """Return logical allocated capacity without summing KV groups."""
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_blocks"):
+            return 0
+        try:
+            block_ids = kv_cache_manager.get_blocks(request.request_id).get_block_ids()
+            return max((len(ids) for ids in block_ids), default=0)
+        except (AttributeError, KeyError):
+            return 0
+
+    def _ar_profile_fingerprint(self, block_size: int) -> ProfileFingerprint:
+        model_config = self.vllm_config.model_config
+        model_id = getattr(model_config, "model", None)
+        if model_id is None:
+            hf_config = getattr(model_config, "hf_config", None)
+            model_id = getattr(hf_config, "_name_or_path", "unknown")
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        return ProfileFingerprint(
+            model_id=str(model_id),
+            device_type=str(self._dynamic_hbm_config.resource_profile_device_type),
+            dtype=str(getattr(model_config, "dtype", "unknown")),
+            tp_size=max(
+                1,
+                int(getattr(parallel_config, "tensor_parallel_size", 1)),
+            ),
+            block_size=block_size,
+            execution_mode="async" if getattr(model_config, "async_chunk", False) else "default",
+        )
+
+    def _ar_resource_profile_store(self, block_size: int) -> ARProfileStore | None:
+        if self._dynamic_hbm_ar_profile_loaded:
+            return self._dynamic_hbm_ar_profile_store
+        self._dynamic_hbm_ar_profile_loaded = True
+        path = self._dynamic_hbm_config.resource_profile_path
+        if not path:
+            return None
+        try:
+            store = ARProfileStore.read_jsonl(path)
+            store.require_fingerprint(self._ar_profile_fingerprint(block_size))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Unable to load AR resource profile %s; using hard fallback: %s",
+                path,
+                exc,
+            )
+            self._resource_admission_counts["profile_load_error"] = (
+                self._resource_admission_counts.get("profile_load_error", 0) + 1
+            )
+            return None
+        self._dynamic_hbm_ar_profile_store = store
+        return store
+
+    def _ar_resource_context(self, request: Any) -> ARRequestResourceContext | None:
+        """Build estimator input from scheduler state without hiding it in the estimator."""
+        estimator = self._ar_resource_estimator()
+        if estimator is None or estimator.block_size is None:
+            return None
+
+        generated = getattr(request, "num_output_tokens", None)
+        if generated is None:
+            generated = len(getattr(request, "output_token_ids", ()))
+        streaming = bool(
+            getattr(request, "resumable", False)
+            or getattr(request, "streaming_queue", None) is not None
+        )
+        workload_class = self._ar_workload_classifier.classify(
+            prompt_tokens=max(0, int(getattr(request, "num_prompt_tokens", 0))),
+            max_tokens=max(0, int(getattr(request, "max_tokens", 0))),
+            streaming=streaming,
+        )
+        profile = None
+        store = self._ar_resource_profile_store(estimator.block_size)
+        if store is not None:
+            candidate = store.get(workload_class)
+            if (
+                candidate is not None
+                and candidate.sample_count
+                >= self._dynamic_hbm_config.resource_profile_min_samples
+            ):
+                profile = candidate
+        return ARRequestResourceContext(
+            num_prompt_tokens=max(0, int(getattr(request, "num_prompt_tokens", 0))),
+            max_tokens=max(0, int(getattr(request, "max_tokens", 0))),
+            block_size=estimator.block_size,
+            num_computed_tokens=max(0, int(getattr(request, "num_computed_tokens", 0))),
+            num_generated_tokens=max(0, int(generated)),
+            allocated_kv_blocks=self._get_request_allocated_kv_blocks(request),
+            # Exact prefix reuse is owned by KVCacheManager. Until a read-only
+            # query is exposed here, zero is the explicit conservative value.
+            reusable_cached_tokens=0,
+            next_scheduled_tokens=max(
+                1,
+                min(
+                    max(
+                        1,
+                        int(getattr(request, "num_tokens", 0))
+                        - int(getattr(request, "num_computed_tokens", 0)),
+                    ),
+                    int(getattr(self, "_effective_max_num_scheduled_tokens", 1)),
+                ),
+            ),
+            expected_output_tokens=(
+                profile.p50_output_tokens if profile is not None else None
+            ),
+            quantile_output_tokens=(
+                profile.output_tokens_at(
+                    self._dynamic_hbm_config.resource_target_coverage
+                )
+                if profile is not None
+                else None
+            ),
+            workload_class=workload_class,
+            target_coverage=self._dynamic_hbm_config.resource_target_coverage,
+            profile_version=(profile.profile_version if profile is not None else None),
+            sample_count=(profile.sample_count if profile is not None else 0),
+        )
+
+    def _record_resource_admission_decision(
+        self,
+        decision: AdmissionDecision,
+        request: Any | None = None,
+    ) -> None:
+        self._last_resource_admission_decision = decision
+        key = decision.reason.value
+        self._resource_admission_counts[key] = self._resource_admission_counts.get(key, 0) + 1
+        if decision.shadow_would_defer:
+            self._resource_admission_counts["shadow_would_defer"] = (
+                self._resource_admission_counts.get("shadow_would_defer", 0) + 1
+            )
+        request_id = getattr(request, "request_id", None)
+        if request_id is not None and decision.estimate is not None:
+            self._resource_observation_collector.begin(
+                request_id,
+                decision.estimate,
+                baseline_allocated_kv_blocks=self._get_request_allocated_kv_blocks(
+                    request
+                ),
+                prompt_tokens=max(
+                    0, int(getattr(request, "num_prompt_tokens", 0))
+                ),
+                requested_max_tokens=max(
+                    0, int(getattr(request, "max_tokens", 0))
+                ),
+                block_size=max(
+                    1,
+                    int(getattr(self._ar_resource_estimator(), "block_size", 1)),
+                ),
+            )
+
+    def _sample_resource_observations(self) -> None:
+        """Sample logical KV ground truth after a scheduler allocation step."""
+        for request in getattr(self, "running", ()):
+            prefill_stats = getattr(request, "prefill_stats", None)
+            self._resource_observation_collector.observe(
+                request.request_id,
+                allocated_kv_blocks=self._get_request_allocated_kv_blocks(request),
+                output_tokens=max(0, int(getattr(request, "num_output_tokens", 0))),
+                local_cached_tokens=max(
+                    0,
+                    int(getattr(prefill_stats, "num_local_cached_tokens", 0)),
+                ),
+                external_cached_tokens=max(
+                    0,
+                    int(getattr(prefill_stats, "num_external_cached_tokens", 0)),
+                ),
+            )
+
+    def drain_resource_observations(self) -> list[Any]:
+        """Drain bounded request-level traces for offline M2 evaluation."""
+        return self._resource_observation_collector.drain_completed()
+
+    def _finish_resource_observation(self, request: Any) -> None:
+        """Capture and persist one request before its KV blocks are released.
+
+        Normal AR completion uses ``OmniARScheduler._free_request`` while
+        abort/error cleanup uses ``finish_requests``.  Keeping the common
+        finalization here prevents either lifecycle path from silently losing
+        shadow observations.  Repeated calls are harmless because ``finish``
+        removes the request from the collector's active set.
+        """
+        # A few lightweight tests construct schedulers through ``__new__``;
+        # production schedulers always initialize the collector in the mixin.
+        collector = getattr(self, "_resource_observation_collector", None)
+        if collector is None:
+            return
+        request_id = request.request_id
+        prefill_stats = getattr(request, "prefill_stats", None)
+        collector.observe(
+            request_id,
+            allocated_kv_blocks=self._get_request_allocated_kv_blocks(request),
+            output_tokens=max(0, int(getattr(request, "num_output_tokens", 0))),
+            local_cached_tokens=max(
+                0,
+                int(getattr(prefill_stats, "num_local_cached_tokens", 0)),
+            ),
+            external_cached_tokens=max(
+                0,
+                int(getattr(prefill_stats, "num_external_cached_tokens", 0)),
+            ),
+        )
+        observation = collector.finish(request_id)
+        if observation is not None and self._resource_observation_writer is not None:
+            self._resource_observation_writer.append(observation)
+
+    def _dynamic_hbm_resource_admission_decision(self) -> AdmissionDecision:
+        """Return an explainable AR resource decision.
+
+        The default ``shadow`` mode observes the counterfactual decision but
+        cannot block scheduling. This keeps M2 model validation separate from
+        the later global commitment policy.
+        """
+        config = getattr(self, "_dynamic_hbm_config", None)
+        if not config or not config.enabled or config.resource_admission_mode == "off":
+            decision = AdmissionDecision(True, AdmissionReason.DISABLED)
+            self._record_resource_admission_decision(decision)
+            return decision
+        waiting = getattr(self, "waiting", None)
+        if not waiting:
+            decision = AdmissionDecision(True, AdmissionReason.EMPTY_QUEUE)
+            self._record_resource_admission_decision(decision)
+            return decision
+        next_request = next(iter(waiting), None)
+        if next_request is None:
+            decision = AdmissionDecision(True, AdmissionReason.EMPTY_QUEUE)
+            self._record_resource_admission_decision(decision)
+            return decision
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        context = self._ar_resource_context(next_request)
+        estimator = self._ar_resource_estimator()
+        if (
+            block_pool is None
+            or not hasattr(block_pool, "get_num_free_blocks")
+            or context is None
+            or estimator is None
+        ):
+            decision = AdmissionDecision(True, AdmissionReason.ESTIMATOR_UNAVAILABLE)
+            self._record_resource_admission_decision(decision)
+            return decision
+        try:
+            estimate = estimator.estimate(context)
+            decision = evaluate_ar_kv_admission(
+                estimate,
+                free_kv_blocks=block_pool.get_num_free_blocks(),
+                enforce=config.resource_admission_mode == "enforce",
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            logger.warning("AR resource estimation failed; leaving admission to safety guard: %s", exc)
+            decision = AdmissionDecision(True, AdmissionReason.ESTIMATOR_ERROR)
+        self._record_resource_admission_decision(decision, next_request)
+        return decision
+
+    def _dynamic_hbm_next_waiting_request_fits(self) -> bool:
+        """Whether the head-of-line waiting AR request's estimated KV-block
+        cost fits in the replica's currently free KV blocks.
+
+        This refines admission beyond the uniform "1 request = 1 slot" count
+        in ``_dynamic_hbm_allows_new_admission``: a long-prompt/long-output
+        request can be rejected even when a free slot exists, instead of
+        being admitted and only failing later under KV pressure. Disabled
+        (returns True, i.e. no additional restriction) unless dynamic HBM is
+        enabled and both the block size and KV pool free-block count are
+        resolvable.
+        """
+        # Compatibility helper used by H10: report the counterfactual fit even
+        # when production rollout is in shadow mode.
+        decision = self._dynamic_hbm_resource_admission_decision()
+        return not decision.shadow_would_defer and decision.reason is not AdmissionReason.KV_PEAK_RISK
 
     def _dynamic_max_num_running_reqs(self) -> int:
         configured_cap = self.max_num_running_reqs
@@ -840,6 +1175,14 @@ class OmniSchedulerMixin:
             if isinstance(request_ids, Iterator):
                 request_ids = tuple(request_ids)
             target_request_ids = set(request_ids)
+
+        # Capture the final logical peak/output before upstream frees KV block
+        # tables. Requests never observed in M2 shadow mode are harmless no-ops.
+        for request_id in target_request_ids:
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            self._finish_resource_observation(request)
 
         skipped_waiting_ids = {r.request_id for r in getattr(self, "skipped_waiting", ())}
         pre_adapter_streaming_wait_ids = {
