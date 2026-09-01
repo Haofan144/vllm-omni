@@ -164,6 +164,7 @@ class AdmissionDecision:
     required: int = 0
     available: int = 0
     shadow_would_defer: bool = False
+    correction: float = 1.0
 
 
 @runtime_checkable
@@ -270,11 +271,27 @@ def evaluate_ar_kv_admission(
     *,
     free_kv_blocks: int,
     enforce: bool,
+    correction: float = 1.0,
+    uncertainty_multiplier: float = 1.0,
 ) -> AdmissionDecision:
-    """Evaluate an estimate without reading scheduler state."""
+    """Evaluate an estimate without reading scheduler state.
+
+    ``required`` is the admission demand — the quantile peak scaled by the
+    online calibration ``correction`` and a fixed ``uncertainty_multiplier`` —
+    not the raw quantile estimate. Both default to ``1.0`` (no correction),
+    so callers without a calibrator get the original uncorrected behavior.
+    The scaled demand is capped at ``hard_peak_kv_blocks``: calibration may
+    make a systematically-underestimating profile more conservative, but it
+    must never demand more than the request's own worst-case bound.
+    """
     if free_kv_blocks < 0:
         raise ValueError("free_kv_blocks must be non-negative")
-    required = estimate.logical.quantile_peak_kv_blocks
+    if correction <= 0 or uncertainty_multiplier <= 0:
+        raise ValueError("correction and uncertainty_multiplier must be positive")
+    required = min(
+        estimate.logical.hard_peak_kv_blocks,
+        math.ceil(estimate.logical.quantile_peak_kv_blocks * correction * uncertainty_multiplier),
+    )
     would_defer = required > free_kv_blocks
     if not would_defer:
         return AdmissionDecision(
@@ -283,6 +300,7 @@ def evaluate_ar_kv_admission(
             estimate=estimate,
             required=required,
             available=free_kv_blocks,
+            correction=correction,
         )
     return AdmissionDecision(
         allowed=not enforce,
@@ -291,4 +309,5 @@ def evaluate_ar_kv_admission(
         required=required,
         available=free_kv_blocks,
         shadow_would_defer=not enforce,
+        correction=correction,
     )

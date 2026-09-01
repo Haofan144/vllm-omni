@@ -33,6 +33,7 @@ from vllm_omni.core.memory_coordinator import (
     AdmissionReason,
     BudgetAllocator,
     DynamicHBMConfig,
+    OnlineCalibrator,
     ReplicaMemoryReport,
     ProfileFingerprint,
     ResourceObservationCollector,
@@ -135,6 +136,7 @@ class OmniSchedulerMixin:
         self._resource_admission_counts: dict[str, int] = {}
         self._last_resource_admission_decision: AdmissionDecision | None = None
         self._resource_observation_collector = ResourceObservationCollector()
+        self._resource_calibrator = OnlineCalibrator()
         self._ar_workload_classifier = ARWorkloadClassifier()
         self._dynamic_hbm_ar_profile_store: ARProfileStore | None = None
         self._dynamic_hbm_ar_profile_loaded = False
@@ -575,8 +577,10 @@ class OmniSchedulerMixin:
             ),
         )
         observation = collector.finish(request_id)
-        if observation is not None and self._resource_observation_writer is not None:
-            self._resource_observation_writer.append(observation)
+        if observation is not None:
+            self._resource_calibrator.update(observation)
+            if self._resource_observation_writer is not None:
+                self._resource_observation_writer.append(observation)
 
     def _dynamic_hbm_resource_admission_decision(self) -> AdmissionDecision:
         """Return an explainable AR resource decision.
@@ -615,10 +619,16 @@ class OmniSchedulerMixin:
             return decision
         try:
             estimate = estimator.estimate(context)
+            snapshot = self._resource_calibrator.snapshot(
+                backend="ar",
+                workload_class=context.workload_class,
+                profile_version=context.profile_version,
+            )
             decision = evaluate_ar_kv_admission(
                 estimate,
                 free_kv_blocks=block_pool.get_num_free_blocks(),
                 enforce=config.resource_admission_mode == "enforce",
+                correction=snapshot.correction,
             )
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             logger.warning("AR resource estimation failed; leaving admission to safety guard: %s", exc)

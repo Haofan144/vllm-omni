@@ -67,6 +67,9 @@ from vllm_omni.core.memory_coordinator import (  # noqa: E402
 __all__ = [
     "BudgetAllocator",
     "DynamicHBMConfig",
+    "FakeBlockPool",
+    "FakeKVCacheManager",
+    "FakeWaitingRequest",
     "RankMemoryReport",
     "RankMemoryReporter",
     "ReplicaMemoryAggregator",
@@ -216,10 +219,78 @@ def run_allocator_trace(
 # --------------------------------------------------------------------------- #
 # 2c. Scheduler-mixin harness (real OmniSchedulerMixin admission budget).
 # --------------------------------------------------------------------------- #
+class FakeWaitingRequest:
+    """Minimal stand-in for ``vllm.v1.request.Request`` fields the AR
+    resource estimator reads (see ``ARResourceEstimator.estimate``)."""
+
+    def __init__(
+        self,
+        *,
+        num_prompt_tokens: int,
+        max_tokens: int,
+        request_id: str = "fake",
+        num_output_tokens: int = 0,
+    ) -> None:
+        self.num_prompt_tokens = num_prompt_tokens
+        self.max_tokens = max_tokens
+        self.request_id = request_id
+        self.num_output_tokens = num_output_tokens
+        self.prefill_stats = None
+
+
+class FakeBlockPool:
+    """Minimal stand-in for ``KVCacheManager.block_pool``."""
+
+    def __init__(self, free_blocks: int) -> None:
+        self._free = free_blocks
+
+    def get_num_free_blocks(self) -> int:
+        return self._free
+
+    def set_free_blocks(self, n: int) -> None:
+        self._free = n
+
+
+class _FakeAllocatedBlocks:
+    def __init__(self, block_ids: list[int]) -> None:
+        self._block_ids = block_ids
+
+    def get_block_ids(self) -> list[list[int]]:
+        return [self._block_ids]
+
+
+class FakeKVCacheManager:
+    """Stand-in for ``KVCacheManager`` exposing ``get_blocks`` so
+    ``_get_request_allocated_kv_blocks`` can report real observed ground
+    truth instead of silently defaulting to 0 (its behavior when
+    ``get_blocks`` is absent, as with the plain ``SimpleNamespace`` other
+    harness scenarios use)."""
+
+    def __init__(self, block_pool: FakeBlockPool) -> None:
+        self.block_pool = block_pool
+        self._allocated: dict[str, int] = {}
+
+    def set_allocated_blocks(self, request_id: str, num_blocks: int) -> None:
+        self._allocated[request_id] = num_blocks
+
+    def get_blocks(self, request_id: str) -> _FakeAllocatedBlocks:
+        return _FakeAllocatedBlocks(list(range(self._allocated.get(request_id, 0))))
+
+
 class SchedulerHarness:
     """Thin real-mixin wrapper mirroring tests/core/sched/test_dynamic_hbm_admission_gate.py."""
 
-    def __init__(self, *, cap: int = 16, tokens: int = 4096, running: int = 0, config: dict | None = None):
+    def __init__(
+        self,
+        *,
+        cap: int = 16,
+        tokens: int = 4096,
+        running: int = 0,
+        config: dict | None = None,
+        block_size: int = 16,
+        free_kv_blocks: int | None = None,
+        track_allocated_blocks: bool = False,
+    ):
         from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
         class _S(OmniSchedulerMixin):
@@ -235,6 +306,15 @@ class SchedulerHarness:
                         dynamic_hbm=config or {"enabled": True},
                         async_chunk=False,
                     )
+                )
+                self.cache_config = SimpleNamespace(block_size=block_size)
+                self.block_pool = FakeBlockPool(
+                    free_kv_blocks if free_kv_blocks is not None else 1 << 30
+                )
+                self.kv_cache_manager = (
+                    FakeKVCacheManager(self.block_pool)
+                    if track_allocated_blocks
+                    else SimpleNamespace(block_pool=self.block_pool)
                 )
                 self._init_dynamic_hbm_scheduling_state()
 
@@ -264,12 +344,34 @@ class SchedulerHarness:
     def allows_new_admission(self) -> bool:
         return self._s._dynamic_hbm_allows_new_admission()
 
+    def next_waiting_request_fits(self) -> bool:
+        return self._s._dynamic_hbm_next_waiting_request_fits()
+
+    def resource_admission_decision(self):
+        return self._s._dynamic_hbm_resource_admission_decision()
+
+    def finish_resource_observation(self, request: FakeWaitingRequest) -> None:
+        self._s._finish_resource_observation(request)
+
+    @property
+    def calibrator(self):
+        return self._s._resource_calibrator
+
     def max_running(self) -> int:
         return self._s._dynamic_max_num_running_reqs()
 
     def set_running(self, n: int) -> None:
         self._s.running = [object()] * n
         self._s._recompute_effective_dynamic_hbm_budget()
+
+    def set_waiting(self, requests: list[FakeWaitingRequest]) -> None:
+        self._s.waiting = requests
+
+    def set_free_kv_blocks(self, n: int) -> None:
+        self._s.block_pool.set_free_blocks(n)
+
+    def set_allocated_blocks(self, request_id: str, num_blocks: int) -> None:
+        self._s.kv_cache_manager.set_allocated_blocks(request_id, num_blocks)
 
     def apply(self, *, generation: int, cap: int, state: SafetyState, pressure: float = 0.92, report: int = 1) -> bool:
         return self._s.apply_stage_budget_decision(

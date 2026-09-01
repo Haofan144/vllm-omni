@@ -8,6 +8,10 @@ from vllm_omni.core.memory_coordinator.protocol import (
     StageBudgetDecision,
 )
 from vllm_omni.core.memory_coordinator.reporter import RankMemoryReporter
+from vllm_omni.core.memory_coordinator.resource_calibrator import (
+    CalibrationSnapshot,
+    OnlineCalibrator,
+)
 from vllm_omni.core.memory_coordinator.resource_observer import (
     ResourceObservation,
     ResourceObservationCollector,
@@ -45,9 +49,11 @@ __all__ = [
     "AdmissionDecision",
     "AdmissionReason",
     "BudgetAllocator",
+    "CalibrationSnapshot",
     "DynamicHBMConfig",
     "EstimateProvenance",
     "LogicalResourceDemand",
+    "OnlineCalibrator",
     "PhysicalResourceDemand",
     "ProfileFingerprint",
     "RankMemoryReport",
