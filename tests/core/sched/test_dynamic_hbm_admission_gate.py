@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
 from vllm_omni.core.memory_coordinator import DynamicHBMConfig, SafetyState
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -15,6 +16,7 @@ class _Scheduler(OmniSchedulerMixin):
         self.max_num_running_reqs = cap
         self.max_num_scheduled_tokens = tokens
         self.running = [object()] * running
+        self.policy = SchedulingPolicy.FCFS
         self.waiting = []
         self.num_waiting_for_streaming_input = 0
         self.vllm_config = SimpleNamespace(
@@ -200,3 +202,153 @@ def test_resource_context_ignores_prefill_stats_before_real_scheduling() -> None
     context = scheduler._ar_resource_context(request)
     assert context is not None
     assert context.reusable_cached_tokens == 0
+
+
+class _SizedRequest:
+    """A waiting request whose block_size=16 KV cost is
+    ceil((num_prompt_tokens + max_tokens) / 16) blocks (no profile loaded,
+    so the estimator falls back to the hard max_tokens bound)."""
+
+    num_computed_tokens = 0
+    num_output_tokens = 0
+
+    def __init__(self, request_id: str, *, prompt_tokens: int, max_tokens: int):
+        self.request_id = request_id
+        self.num_prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+
+
+def _bypass_scheduler(
+    *, free_blocks: int, scan_limit: int, aging_ms: float = 30_000.0
+) -> _Scheduler:
+    scheduler = _Scheduler(
+        config={
+            "enabled": True,
+            "resource_admission_mode": "enforce",
+            "resource_admission_bypass_scan_limit": scan_limit,
+            "resource_admission_bypass_aging_ms": aging_ms,
+        },
+    )
+    scheduler.cache_config = SimpleNamespace(block_size=16)
+    scheduler.kv_cache_manager = SimpleNamespace(block_pool=_BlockPool(free_blocks))
+    return scheduler
+
+
+def test_bypass_scan_limit_zero_returns_empty_queue() -> None:
+    # scan_limit=0 is the default and must reproduce the pre-bypass
+    # all-or-nothing behavior: the returned queue is always empty regardless
+    # of whether later requests would fit.
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=0)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    small = _SizedRequest("small", prompt_tokens=8, max_tokens=8)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(small)
+    bypassed = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert list(bypassed) == []
+
+
+def test_bypass_admits_a_later_request_that_fits_past_an_oversized_head() -> None:
+    # 8 free blocks: "huge" needs far more than that and cannot fit; "small"
+    # needs 1 block and fits. The head-of-line request is always included
+    # (so its own admission decision still runs), and the fitting later
+    # request should be pulled into the same step's candidate queue.
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=5)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    small = _SizedRequest("small", prompt_tokens=8, max_tokens=8)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(small)
+    bypassed = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    ids = [req.request_id for req in bypassed]
+    assert ids == ["huge", "small"]
+    assert scheduler._resource_admission_bypass_count == 1
+    assert scheduler._resource_admission_bypassed_requests == 1
+
+
+def test_bypass_does_not_admit_a_later_request_that_also_does_not_fit() -> None:
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=5)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    also_huge = _SizedRequest("also_huge", prompt_tokens=1000, max_tokens=1000)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(also_huge)
+    bypassed = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    ids = [req.request_id for req in bypassed]
+    assert ids == ["huge"]
+    assert scheduler._resource_admission_bypass_count == 0
+
+
+def test_bypass_respects_scan_limit() -> None:
+    # scan_limit=1: only the first candidate past the head is scanned, even
+    # though the second candidate past the head would also fit.
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=1)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    also_huge = _SizedRequest("also_huge", prompt_tokens=1000, max_tokens=1000)
+    small = _SizedRequest("small", prompt_tokens=8, max_tokens=8)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(also_huge)
+    scheduler.waiting.add_request(small)
+    bypassed = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    ids = [req.request_id for req in bypassed]
+    assert ids == ["huge"]
+
+
+def test_bypass_scan_does_not_pollute_admission_counts() -> None:
+    # Candidates scanned past the head are evaluated with record=False so
+    # the step's admission-decision telemetry still reflects only the real
+    # head-of-line decision, not every candidate probed during the scan.
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=5)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    small = _SizedRequest("small", prompt_tokens=8, max_tokens=8)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(small)
+    scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert sum(scheduler._resource_admission_counts.values()) == 0
+
+
+def test_bypass_aging_stops_after_threshold(monkeypatch) -> None:
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=5, aging_ms=1.0)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    small = _SizedRequest("small", prompt_tokens=8, max_tokens=8)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler.waiting.add_request(small)
+
+    times = iter([1000.0, 1000.05])
+
+    def fake_monotonic():
+        return next(times)
+
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.time.monotonic", fake_monotonic
+    )
+    # First call seeds head_of_line_since["huge"] = 1000.0 and, since
+    # (now - started_at) == 0 < aging_ms, still bypasses "small".
+    first = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert [req.request_id for req in first] == ["huge", "small"]
+    # Second call: 50ms later >= aging_ms=1ms, so aging stops the bypass scan
+    # for this step even though "small" would still fit.
+    second = scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert [req.request_id for req in second] == ["huge"]
+    assert scheduler._resource_admission_aging_stops == 1
+
+
+def test_bypass_clears_head_of_line_state_once_request_leaves_queue() -> None:
+    scheduler = _bypass_scheduler(free_blocks=8, scan_limit=5)
+    huge = _SizedRequest("huge", prompt_tokens=1000, max_tokens=1000)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(huge)
+    scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert "huge" in scheduler._resource_admission_head_of_line_since
+
+    # "huge" is gone next step (admitted, finished, or aborted elsewhere);
+    # its aging timer must not leak.
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(
+        _SizedRequest("other", prompt_tokens=8, max_tokens=8)
+    )
+    scheduler._dynamic_hbm_bounded_bypass_waiting()
+    assert "huge" not in scheduler._resource_admission_head_of_line_since

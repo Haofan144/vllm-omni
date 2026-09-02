@@ -20,7 +20,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.core.memory_coordinator import ReplicaMemoryReport, SafetyState
+from vllm_omni.core.memory_coordinator import AdmissionReason, ReplicaMemoryReport, SafetyState
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine import OmniEngineCoreOutput
@@ -179,6 +179,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self
         ) or not resource_decision.allowed
         should_defer = static_guard_active or dynamic_guard_active
+        # Only a head-of-line request that itself does not fit is eligible for
+        # bounded bypass (S12.3): a global block-exhaustion guard or an
+        # occupied-slot-count cap gives later requests nothing to bypass into.
+        self._hbm_admission_bypass_eligible = (
+            should_defer
+            and not static_guard_active
+            and resource_decision.reason is AdmissionReason.KV_PEAK_RISK
+        )
         was_active = getattr(self, "_hbm_admission_was_active", False)
 
         if should_defer:
@@ -323,9 +331,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
 
         original_waiting = None
+        bypass_candidate_ids: set[str] = set()
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
-            self.waiting = create_request_queue(self.policy)
+            if getattr(self, "_hbm_admission_bypass_eligible", False):
+                self.waiting = self._dynamic_hbm_bounded_bypass_waiting()
+                bypass_candidate_ids = {req.request_id for req in self.waiting}
+            else:
+                self.waiting = create_request_queue(self.policy)
 
         configured_max_num_running_reqs = self.max_num_running_reqs
         configured_max_num_scheduled_tokens = self.max_num_scheduled_tokens
@@ -340,8 +353,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.max_num_scheduled_tokens = configured_max_num_scheduled_tokens
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
+                if bypass_candidate_ids:
+                    deferred_ids = {req.request_id for req in deferred_waiting}
+                    admitted_ids = bypass_candidate_ids - deferred_ids
+                    if admitted_ids:
+                        # These requests were pulled out of the substitute
+                        # bypass queue and admitted by super().schedule().
+                        # original_waiting still holds the very same (from its
+                        # own point of view, unadmitted) request objects, so
+                        # they must be removed here -- otherwise the merge
+                        # below would leave them duplicated between
+                        # self.waiting and self.running.
+                        original_waiting.remove_requests(
+                            [req for req in original_waiting if req.request_id in admitted_ids]
+                        )
                 if deferred_waiting:
-                    original_waiting.prepend_requests(deferred_waiting)
+                    # prepend_requests prepends in reverse order of its input
+                    # (see RequestQueue.prepend_requests), so reverse here to
+                    # keep deferred_waiting's own FIFO order -- otherwise a
+                    # scanned-but-rejected request would land ahead of the
+                    # true head-of-line request it was scanned past.
+                    original_waiting.prepend_requests(list(reversed(deferred_waiting)))
                 self.waiting = original_waiting
             self._restore_omni_wait_queues()
 

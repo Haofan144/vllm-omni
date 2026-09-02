@@ -29,6 +29,7 @@ SCRIPTS = [
     ("H10", "H10_resource_aware_admission.py"),
     ("H11", "H11_ar_profile_prediction.py"),
     ("H12", "H12_ewma_calibration_effectiveness.py"),
+    ("H13", "H13_bounded_bypass_effectiveness.py"),
 ]
 
 
@@ -57,7 +58,7 @@ def main() -> None:
         else:
             rows.append((hyp, f"NO RESULT (exit {proc.returncode})", ""))
 
-    print("\n\n================ H1-H7, H10-H12 VERDICT TABLE ================")
+    print("\n\n================ H1-H7, H10-H13 VERDICT TABLE ================")
     for hyp, verdict, note in rows:
         print(f"  {hyp}: {verdict:<22} {note}")
     print("====================================================")

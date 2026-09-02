@@ -291,6 +291,8 @@ class SchedulerHarness:
         free_kv_blocks: int | None = None,
         track_allocated_blocks: bool = False,
     ):
+        from vllm.v1.core.sched.request_queue import SchedulingPolicy
+
         from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
         class _S(OmniSchedulerMixin):
@@ -298,6 +300,7 @@ class SchedulerHarness:
                 self.max_num_running_reqs = cap
                 self.max_num_scheduled_tokens = tokens
                 self.running = [object()] * running
+                self.policy = SchedulingPolicy.FCFS
                 self.waiting = []
                 self.num_waiting_for_streaming_input = 0
                 self.vllm_config = SimpleNamespace(
@@ -349,6 +352,28 @@ class SchedulerHarness:
 
     def resource_admission_decision(self):
         return self._s._dynamic_hbm_resource_admission_decision()
+
+    def bounded_bypass_waiting(self) -> list[FakeWaitingRequest]:
+        """Run the bounded-bypass queue filter and return the resulting
+        candidate order as a plain list (the requests ``super().schedule()``
+        would get a chance to admit this step)."""
+        return list(self._s._dynamic_hbm_bounded_bypass_waiting())
+
+    @property
+    def bypass_count(self) -> int:
+        return self._s._resource_admission_bypass_count
+
+    @property
+    def bypassed_requests(self) -> int:
+        return self._s._resource_admission_bypassed_requests
+
+    @property
+    def aging_stops(self) -> int:
+        return self._s._resource_admission_aging_stops
+
+    @property
+    def head_of_line_since(self) -> dict[str, float]:
+        return self._s._resource_admission_head_of_line_since
 
     def finish_resource_observation(self, request: FakeWaitingRequest) -> None:
         self._s._finish_resource_observation(request)

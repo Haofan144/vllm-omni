@@ -40,6 +40,16 @@ class DynamicHBMConfig:
     resource_profile_min_samples: int = 20
     resource_observation_path: str | None = None
     resource_observation_flush_size: int = 1
+    # Bounded bypass (M2 design doc S12.3): when the head-of-line waiting
+    # request's estimated demand does not fit, scan up to this many
+    # subsequent waiting requests for one that does fit rather than freezing
+    # the whole queue. 0 keeps the original all-or-nothing behavior.
+    resource_admission_bypass_scan_limit: int = 0
+    # Once the head-of-line request has waited at least this long, stop
+    # bypassing it (even if bypass_scan_limit would otherwise allow it) so a
+    # large request cannot be starved indefinitely by an unbroken stream of
+    # smaller ones.
+    resource_admission_bypass_aging_ms: float = 30_000.0
 
     def __post_init__(self) -> None:
         if self.min_num_seqs < 1:
@@ -94,6 +104,14 @@ class DynamicHBMConfig:
         if self.resource_observation_flush_size < 1:
             raise ValueError(
                 "dynamic_hbm.resource_observation_flush_size must be positive"
+            )
+        if self.resource_admission_bypass_scan_limit < 0:
+            raise ValueError(
+                "dynamic_hbm.resource_admission_bypass_scan_limit must be non-negative"
+            )
+        if self.resource_admission_bypass_aging_ms <= 0:
+            raise ValueError(
+                "dynamic_hbm.resource_admission_bypass_aging_ms must be positive"
             )
 
     @classmethod

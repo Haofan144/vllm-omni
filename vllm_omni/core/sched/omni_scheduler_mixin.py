@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
@@ -135,6 +136,13 @@ class OmniSchedulerMixin:
         self._dynamic_hbm_safety_state = SafetyState.NORMAL
         self._resource_admission_counts: dict[str, int] = {}
         self._last_resource_admission_decision: AdmissionDecision | None = None
+        # First monotonic time each request was observed as an un-fitting
+        # head-of-line request. Cleared once the request is admitted, leaves
+        # the queue, or ages out. Powers the bounded-bypass aging guard.
+        self._resource_admission_head_of_line_since: dict[str, float] = {}
+        self._resource_admission_bypass_count = 0
+        self._resource_admission_bypassed_requests = 0
+        self._resource_admission_aging_stops = 0
         self._resource_observation_collector = ResourceObservationCollector()
         self._resource_calibrator = OnlineCalibrator()
         self._ar_workload_classifier = ARWorkloadClassifier()
@@ -594,8 +602,18 @@ class OmniSchedulerMixin:
             if self._resource_observation_writer is not None:
                 self._resource_observation_writer.append(observation)
 
-    def _dynamic_hbm_resource_admission_decision(self) -> AdmissionDecision:
-        """Return an explainable AR resource decision.
+    def _dynamic_hbm_resource_admission_decision(
+        self, request: Any | None = None, *, record: bool = True
+    ) -> AdmissionDecision:
+        """Return an explainable AR resource decision for one request.
+
+        Defaults to the head-of-line waiting request when ``request`` is not
+        given, preserving the original single-request call contract used by
+        the H10/H11/H12 experiment harness. ``_dynamic_hbm_bounded_bypass_waiting``
+        also calls this per-candidate while scanning past a head-of-line
+        request that does not fit, so ``record`` lets that scan evaluate
+        candidates without polluting ``_resource_admission_counts`` for
+        requests that are not actually the step's admission decision.
 
         The default ``shadow`` mode observes the counterfactual decision but
         cannot block scheduling. This keeps M2 model validation separate from
@@ -604,21 +622,20 @@ class OmniSchedulerMixin:
         config = getattr(self, "_dynamic_hbm_config", None)
         if not config or not config.enabled or config.resource_admission_mode == "off":
             decision = AdmissionDecision(True, AdmissionReason.DISABLED)
-            self._record_resource_admission_decision(decision)
+            if record:
+                self._record_resource_admission_decision(decision)
             return decision
-        waiting = getattr(self, "waiting", None)
-        if not waiting:
+        if request is None:
+            waiting = getattr(self, "waiting", None)
+            request = next(iter(waiting), None) if waiting else None
+        if request is None:
             decision = AdmissionDecision(True, AdmissionReason.EMPTY_QUEUE)
-            self._record_resource_admission_decision(decision)
-            return decision
-        next_request = next(iter(waiting), None)
-        if next_request is None:
-            decision = AdmissionDecision(True, AdmissionReason.EMPTY_QUEUE)
-            self._record_resource_admission_decision(decision)
+            if record:
+                self._record_resource_admission_decision(decision)
             return decision
         kv_cache_manager = getattr(self, "kv_cache_manager", None)
         block_pool = getattr(kv_cache_manager, "block_pool", None)
-        context = self._ar_resource_context(next_request)
+        context = self._ar_resource_context(request)
         estimator = self._ar_resource_estimator()
         if (
             block_pool is None
@@ -627,7 +644,8 @@ class OmniSchedulerMixin:
             or estimator is None
         ):
             decision = AdmissionDecision(True, AdmissionReason.ESTIMATOR_UNAVAILABLE)
-            self._record_resource_admission_decision(decision)
+            if record:
+                self._record_resource_admission_decision(decision)
             return decision
         try:
             estimate = estimator.estimate(context)
@@ -645,7 +663,8 @@ class OmniSchedulerMixin:
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             logger.warning("AR resource estimation failed; leaving admission to safety guard: %s", exc)
             decision = AdmissionDecision(True, AdmissionReason.ESTIMATOR_ERROR)
-        self._record_resource_admission_decision(decision, next_request)
+        if record:
+            self._record_resource_admission_decision(decision, request)
         return decision
 
     def _dynamic_hbm_next_waiting_request_fits(self) -> bool:
@@ -664,6 +683,65 @@ class OmniSchedulerMixin:
         # when production rollout is in shadow mode.
         decision = self._dynamic_hbm_resource_admission_decision()
         return not decision.shadow_would_defer and decision.reason is not AdmissionReason.KV_PEAK_RISK
+
+    def _dynamic_hbm_bounded_bypass_waiting(self) -> Any:
+        """Filter ``self.waiting`` for one scheduling step under resource-aware
+        enforcement, instead of freezing the entire queue behind a
+        head-of-line request that does not fit (M2 design doc S12.3).
+
+        Returns a new ``RequestQueue`` (same type/policy as ``self.waiting``)
+        containing, in original FIFO order: the head-of-line request itself
+        (so the caller's normal admission check still applies to it and it is
+        never silently dropped), plus up to ``resource_admission_bypass_scan_limit``
+        subsequent requests whose individual resource estimate fits the
+        currently free KV blocks. Requests that do not fit, and requests
+        beyond the scan limit, are left out of the returned queue -- callers
+        restore them to the front of ``self.waiting`` afterward, exactly as
+        the pre-M2 empty-queue swap already did.
+
+        Only called when the head-of-line request itself is the reason for
+        deferral (``KV_PEAK_RISK``); an empty queue, a disabled estimator, or
+        a global KV exhaustion guard call this scan pointless, so callers
+        should keep using the original all-or-nothing swap for those cases.
+        """
+        waiting = self.waiting
+        scan_limit = self._dynamic_hbm_config.resource_admission_bypass_scan_limit
+        bypassed = create_request_queue(self.policy)
+        if scan_limit <= 0:
+            return bypassed
+
+        head_of_line_since = self._resource_admission_head_of_line_since
+        now = time.monotonic()
+        aging_ms = self._dynamic_hbm_config.resource_admission_bypass_aging_ms
+        live_ids = set()
+        scanned = 0
+        for index, candidate in enumerate(waiting):
+            live_ids.add(candidate.request_id)
+            if index == 0:
+                bypassed.add_request(candidate)
+                started_at = head_of_line_since.setdefault(candidate.request_id, now)
+                if (now - started_at) * 1000.0 >= aging_ms:
+                    self._resource_admission_aging_stops += 1
+                    break
+                continue
+            if scanned >= scan_limit:
+                break
+            scanned += 1
+            decision = self._dynamic_hbm_resource_admission_decision(candidate, record=False)
+            # ``reason`` reflects whether the estimate itself fits the
+            # currently free KV blocks; ``allowed``/``shadow_would_defer``
+            # instead encode the enforcement policy (shadow mode always sets
+            # ``allowed=True`` even for a request that does not fit), so the
+            # fit check must key off ``reason`` here.
+            if decision.reason is not AdmissionReason.KV_PEAK_RISK:
+                bypassed.add_request(candidate)
+                self._resource_admission_bypass_count += 1
+                self._resource_admission_bypassed_requests += 1
+
+        stale_ids = set(head_of_line_since) - live_ids
+        for stale_id in stale_ids:
+            head_of_line_since.pop(stale_id, None)
+        return bypassed
 
     def _dynamic_max_num_running_reqs(self) -> int:
         configured_cap = self.max_num_running_reqs

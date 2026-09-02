@@ -22,6 +22,7 @@ class AdmissionReason(StrEnum):
     UNKNOWN_WORKLOAD_CLASS = "unknown_workload_class"
     ESTIMATOR_UNAVAILABLE = "estimator_unavailable"
     ESTIMATOR_ERROR = "estimator_error"
+    HEAD_OF_LINE_AGED = "head_of_line_aged"
 
 
 @dataclass(frozen=True)
