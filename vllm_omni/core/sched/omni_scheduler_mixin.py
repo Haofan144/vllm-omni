@@ -33,6 +33,9 @@ from vllm_omni.core.memory_coordinator import (
     AdmissionDecision,
     AdmissionReason,
     BudgetAllocator,
+    Code2WavRequestContext,
+    Code2WavResourceEstimator,
+    Code2WavWorkloadClassifier,
     DynamicHBMConfig,
     OnlineCalibrator,
     ReplicaMemoryReport,
@@ -141,6 +144,22 @@ class OmniSchedulerMixin:
         # head-of-line request. Cleared once the request is admitted, leaves
         # the queue, or ages out. Powers the bounded-bypass aging guard.
         self._resource_admission_head_of_line_since: dict[str, float] = {}
+        # Code2Wav/LLM_GENERATION observation-only telemetry (M2c). Unlike
+        # the AR admission decision above, this never gates scheduling: no
+        # real "free physical bytes" budget exists anywhere in the scheduler
+        # to compare a predicted transient/persistent-byte cost against, so
+        # building an admit/defer decision here would mean fabricating a
+        # budget rather than measuring one. This purely records what
+        # Code2WavResourceEstimator would have predicted for the head-of-line
+        # waiting request each tick, for later offline analysis (the same
+        # role H11's shadow-trace analysis played for the AR estimator before
+        # a real KV-block budget made enforce mode meaningful there).
+        self._code2wav_workload_classifier = Code2WavWorkloadClassifier()
+        self._code2wav_resource_estimator = Code2WavResourceEstimator(
+            self._code2wav_workload_classifier
+        )
+        self._code2wav_observation_count = 0
+        self._code2wav_observation_errors = 0
         self._resource_admission_bypass_count = 0
         self._resource_admission_bypassed_requests = 0
         self._resource_admission_aging_stops = 0
@@ -360,6 +379,12 @@ class OmniSchedulerMixin:
         occupied_slots = len(self.running) + getattr(self, "num_waiting_for_streaming_input", 0)
         return occupied_slots < self._effective_max_num_seqs
 
+    def _dynamic_hbm_execution_type(self) -> Any:
+        """This stage's ``StageExecutionType``, or ``None`` if undeterminable."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        stage_pipeline_config = getattr(model_config, "stage_pipeline_config", None)
+        return getattr(stage_pipeline_config, "execution_type", None)
+
     def _dynamic_hbm_ar_estimator_applies(self) -> bool:
         """Whether this stage's requests are genuine AR text/output tokens.
 
@@ -373,14 +398,100 @@ class OmniSchedulerMixin:
         determined are treated as unsupported (fail closed to "don't apply
         the AR estimator") rather than assumed AR.
         """
-        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        stage_pipeline_config = getattr(model_config, "stage_pipeline_config", None)
-        execution_type = getattr(stage_pipeline_config, "execution_type", None)
+        execution_type = self._dynamic_hbm_execution_type()
         if execution_type is None:
             return False
         from vllm_omni.config.stage_config import StageExecutionType
 
         return execution_type == StageExecutionType.LLM_AR
+
+    def _dynamic_hbm_code2wav_estimator_applies(self) -> bool:
+        """Whether this stage is a Code2Wav-style ``LLM_GENERATION`` decoder.
+
+        Symmetric to ``_dynamic_hbm_ar_estimator_applies``: an execution type
+        that cannot be determined is treated as unsupported, not assumed to
+        be a generation stage.
+        """
+        execution_type = self._dynamic_hbm_execution_type()
+        if execution_type is None:
+            return False
+        from vllm_omni.config.stage_config import StageExecutionType
+
+        return execution_type == StageExecutionType.LLM_GENERATION
+
+    @staticmethod
+    def _code2wav_frame_count(request: Any) -> int:
+        """A request's codec-frame count for this step.
+
+        Mirrors ``OmniGenerationScheduler.schedule()``'s own
+        ``required_tokens = max(len(request.prompt_token_ids), 1)`` --
+        Code2Wav's forward pass derives frame count directly from
+        ``prompt_token_ids`` length (flattened codec ids, ``n // q``; see
+        ``qwen3_tts_code2wav.py``'s ``forward()``), so the scheduler's own
+        placeholder-token accounting already IS the frame count, not a
+        separate concept requiring new bookkeeping.
+        """
+        return max(len(getattr(request, "prompt_token_ids", ()) or ()), 1)
+
+    def _code2wav_resource_context(self, request: Any) -> Code2WavRequestContext | None:
+        """Build estimator input for the head-of-line waiting Code2Wav
+        request, describing the candidate batch it would join (the already-
+        ``running`` requests plus itself) -- see ``Code2WavRequestContext``'s
+        docstring on why cost depends on batchmates, not only the request
+        itself.
+        """
+        try:
+            frame_count = self._code2wav_frame_count(request)
+            running = getattr(self, "running", ())
+            batch_max_frame_count = frame_count
+            for other in running:
+                batch_max_frame_count = max(batch_max_frame_count, self._code2wav_frame_count(other))
+            persistent_state_active = bool(
+                getattr(request, "resumable", False)
+                or getattr(request, "streaming_queue", None) is not None
+            )
+            return Code2WavRequestContext(
+                frame_count=frame_count,
+                batch_size=len(running) + 1,
+                batch_max_frame_count=batch_max_frame_count,
+                persistent_state_active=persistent_state_active,
+                workload_class=self._code2wav_workload_classifier.classify(
+                    batch_size=len(running) + 1,
+                    frame_count=frame_count,
+                    persistent_state_active=persistent_state_active,
+                ),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("Code2Wav resource context build failed: %s", exc)
+            return None
+
+    def _sample_code2wav_resource_observation(self) -> None:
+        """Observation-only telemetry for one ``LLM_GENERATION`` schedule()
+        tick: predicts the head-of-line waiting request's transient/
+        persistent byte cost and records it, without ever gating admission.
+
+        Called unconditionally from ``OmniGenerationScheduler.schedule()``;
+        declines immediately (and cheaply) for any stage that isn't a
+        Code2Wav-style generation stage or has an empty waiting queue, so it
+        adds no real cost to schedulers that don't apply.
+        """
+        if not self._dynamic_hbm_code2wav_estimator_applies():
+            return
+        waiting = getattr(self, "waiting", None)
+        if not waiting:
+            return
+        request = next(iter(waiting), None)
+        if request is None:
+            return
+        try:
+            context = self._code2wav_resource_context(request)
+            if context is None:
+                return
+            self._code2wav_resource_estimator.estimate(context)
+            self._code2wav_observation_count += 1
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            self._code2wav_observation_errors += 1
+            logger.warning("Code2Wav resource observation failed: %s", exc)
 
     def _ar_resource_estimator(self) -> Any:
         """Lazily build (and cache) the AR KV-block estimator for this replica.

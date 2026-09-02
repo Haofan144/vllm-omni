@@ -442,3 +442,76 @@ def test_tts_classify_extra_kwargs_tolerates_non_list_value() -> None:
     request = _RequestWithAdditionalInformation({"task_type": "CustomVoice"})
     extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
     assert extra == {"task_type": "CustomVoice", "ref_audio_present": False}
+
+
+class _Code2WavRequest:
+    def __init__(self, request_id: str, num_frames: int, *, resumable: bool = False):
+        self.request_id = request_id
+        self.prompt_token_ids = [1] * num_frames
+        self.resumable = resumable
+        self.streaming_queue = None
+
+
+def _generation_scheduler(execution_type=None) -> _Scheduler:
+    scheduler = _Scheduler(config={"enabled": True})
+    if execution_type is not None:
+        scheduler.vllm_config.model_config.stage_pipeline_config.execution_type = execution_type
+    return scheduler
+
+
+def test_code2wav_estimator_applies_only_to_llm_generation() -> None:
+    ar_scheduler = _generation_scheduler(StageExecutionType.LLM_AR)
+    assert not ar_scheduler._dynamic_hbm_code2wav_estimator_applies()
+    generation_scheduler = _generation_scheduler(StageExecutionType.LLM_GENERATION)
+    assert generation_scheduler._dynamic_hbm_code2wav_estimator_applies()
+
+
+def test_code2wav_estimator_applies_fails_closed_when_execution_type_unknown() -> None:
+    scheduler = _generation_scheduler()
+    del scheduler.vllm_config.model_config.stage_pipeline_config
+    assert not scheduler._dynamic_hbm_code2wav_estimator_applies()
+    assert not scheduler._dynamic_hbm_ar_estimator_applies()
+
+
+def test_code2wav_resource_context_reflects_batch_composition() -> None:
+    scheduler = _generation_scheduler(StageExecutionType.LLM_GENERATION)
+    scheduler.running = [_Code2WavRequest("running-0", 200)]
+    context = scheduler._code2wav_resource_context(_Code2WavRequest("head", 25))
+    assert context is not None
+    assert context.frame_count == 25
+    assert context.batch_size == 2  # 1 running + the head-of-line candidate
+    assert context.batch_max_frame_count == 200  # padded to the batch's longest member
+
+
+def test_code2wav_resource_context_flags_persistent_state() -> None:
+    scheduler = _generation_scheduler(StageExecutionType.LLM_GENERATION)
+    context = scheduler._code2wav_resource_context(
+        _Code2WavRequest("head", 25, resumable=True)
+    )
+    assert context is not None
+    assert context.persistent_state_active is True
+
+
+def test_sample_code2wav_observation_declines_for_ar_stage() -> None:
+    scheduler = _generation_scheduler(StageExecutionType.LLM_AR)
+    scheduler.waiting = [_Code2WavRequest("head", 25)]
+    scheduler._sample_code2wav_resource_observation()
+    assert scheduler._code2wav_observation_count == 0
+
+
+def test_sample_code2wav_observation_declines_on_empty_queue() -> None:
+    scheduler = _generation_scheduler(StageExecutionType.LLM_GENERATION)
+    scheduler.waiting = []
+    scheduler._sample_code2wav_resource_observation()
+    assert scheduler._code2wav_observation_count == 0
+
+
+def test_sample_code2wav_observation_records_without_gating() -> None:
+    scheduler = _generation_scheduler(StageExecutionType.LLM_GENERATION)
+    scheduler.waiting = [_Code2WavRequest("head", 25)]
+    scheduler._sample_code2wav_resource_observation()
+    assert scheduler._code2wav_observation_count == 1
+    assert scheduler._code2wav_observation_errors == 0
+    # Purely observational: nothing about admission/defer state exists to
+    # assert on here -- there is no admit/defer decision to make.
+    assert not hasattr(scheduler, "_code2wav_admission_counts")

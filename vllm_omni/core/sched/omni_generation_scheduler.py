@@ -107,6 +107,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
         self._process_pending_omni_inputs(model_mode="generation")
+        # M2c observation-only telemetry (see docstring on
+        # _sample_code2wav_resource_observation): predicts, never gates.
+        self._sample_code2wav_resource_observation()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
