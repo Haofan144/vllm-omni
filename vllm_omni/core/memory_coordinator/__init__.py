@@ -29,6 +29,13 @@ from vllm_omni.core.memory_coordinator.resource_profile import (
 from vllm_omni.core.memory_coordinator.tts_resource_estimator import (
     TTSWorkloadClassifier,
 )
+from vllm_omni.core.memory_coordinator.code2wav_resource_estimator import (
+    Code2WavEnvelopeProfile,
+    Code2WavProfileStore,
+    Code2WavRequestContext,
+    Code2WavResourceEstimator,
+    Code2WavWorkloadClassifier,
+)
 from vllm_omni.core.memory_coordinator.resource_estimator import (
     ARRequestResourceContext,
     ARResourceEstimator,
@@ -70,6 +77,11 @@ __all__ = [
     "RequestResourceEstimate",
     "RequestResourceEstimator",
     "SafetyState",
+    "Code2WavEnvelopeProfile",
+    "Code2WavProfileStore",
+    "Code2WavRequestContext",
+    "Code2WavResourceEstimator",
+    "Code2WavWorkloadClassifier",
     "StageBudgetDecision",
     "TTSWorkloadClassifier",
     "build_ar_output_profiles",
