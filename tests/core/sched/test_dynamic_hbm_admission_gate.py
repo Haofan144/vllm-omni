@@ -380,3 +380,65 @@ def test_bypass_clears_head_of_line_state_once_request_leaves_queue() -> None:
     )
     scheduler._dynamic_hbm_bounded_bypass_waiting()
     assert "huge" not in scheduler._resource_admission_head_of_line_since
+
+
+def test_default_workload_classifier_is_ar() -> None:
+    scheduler = _Scheduler()
+    assert type(scheduler._ar_workload_classifier).__name__ == "ARWorkloadClassifier"
+
+
+def test_ar_workload_classifier_config_resolves_configured_classifier() -> None:
+    scheduler = _Scheduler(
+        config={
+            "enabled": True,
+            "ar_workload_classifier": (
+                "vllm_omni.core.memory_coordinator.tts_resource_estimator."
+                "TTSWorkloadClassifier"
+            ),
+        }
+    )
+    assert type(scheduler._ar_workload_classifier).__name__ == "TTSWorkloadClassifier"
+
+
+class _RequestWithAdditionalInformation(_WaitingRequest):
+    def __init__(self, additional_information):
+        self.additional_information = additional_information
+
+
+def test_tts_classify_extra_kwargs_unwraps_list_convention() -> None:
+    request = _RequestWithAdditionalInformation(
+        {"task_type": ["CustomVoice"], "ref_audio": [["wav", 24000]]}
+    )
+    extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
+    assert extra == {"task_type": "CustomVoice", "ref_audio_present": True}
+
+
+def test_tts_classify_extra_kwargs_detects_ref_audio_via_code_length_only() -> None:
+    # A precomputed-profile request may carry only ref_code_length (no raw
+    # ref_audio waveform) -- see serving_speech.py's precomputed_speakers path.
+    request = _RequestWithAdditionalInformation(
+        {"task_type": ["Base"], "ref_code_length": [42]}
+    )
+    extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
+    assert extra == {"task_type": "Base", "ref_audio_present": True}
+
+
+def test_tts_classify_extra_kwargs_defaults_when_absent() -> None:
+    request = _WaitingRequest()  # no additional_information attribute at all
+    extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
+    assert extra == {}
+
+
+def test_tts_classify_extra_kwargs_defaults_when_fields_missing() -> None:
+    request = _RequestWithAdditionalInformation({})
+    extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
+    assert extra == {"task_type": None, "ref_audio_present": False}
+
+
+def test_tts_classify_extra_kwargs_tolerates_non_list_value() -> None:
+    # Not every model wraps every field in a list (e.g. a differently-shaped
+    # additional_information from a non-Qwen3-TTS model) -- a bare scalar
+    # must not crash the extraction.
+    request = _RequestWithAdditionalInformation({"task_type": "CustomVoice"})
+    extra = OmniSchedulerMixin._tts_classify_extra_kwargs(request)
+    assert extra == {"task_type": "CustomVoice", "ref_audio_present": False}

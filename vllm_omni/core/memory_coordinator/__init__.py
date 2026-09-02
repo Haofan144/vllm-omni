@@ -26,6 +26,9 @@ from vllm_omni.core.memory_coordinator.resource_profile import (
     read_observations_jsonl,
     write_observations_jsonl,
 )
+from vllm_omni.core.memory_coordinator.tts_resource_estimator import (
+    TTSWorkloadClassifier,
+)
 from vllm_omni.core.memory_coordinator.resource_estimator import (
     ARRequestResourceContext,
     ARResourceEstimator,
@@ -68,6 +71,7 @@ __all__ = [
     "RequestResourceEstimator",
     "SafetyState",
     "StageBudgetDecision",
+    "TTSWorkloadClassifier",
     "build_ar_output_profiles",
     "evaluate_ar_kv_admission",
     "read_observations_jsonl",

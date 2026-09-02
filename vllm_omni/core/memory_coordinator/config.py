@@ -50,6 +50,15 @@ class DynamicHBMConfig:
     # large request cannot be starved indefinitely by an unbroken stream of
     # smaller ones.
     resource_admission_bypass_aging_ms: float = 30_000.0
+    # Qualname (e.g. "vllm_omni.core.memory_coordinator.tts_resource_estimator.
+    # TTSWorkloadClassifier") of the workload classifier this stage's AR
+    # resource estimator should use in place of the default
+    # ARWorkloadClassifier. The estimator itself (ARResourceEstimator, KV-block
+    # math) is backend-agnostic and unchanged; only the workload-class key
+    # differs -- e.g. a TTS Talker stage needs task_type/reference-audio
+    # dimensions a plain text-LLM classifier has no notion of. None keeps the
+    # default ARWorkloadClassifier.
+    ar_workload_classifier: str | None = None
 
     def __post_init__(self) -> None:
         if self.min_num_seqs < 1:

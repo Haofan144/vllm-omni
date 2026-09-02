@@ -5,7 +5,7 @@ import math
 import atexit
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from threading import Lock
 
 from vllm_omni.core.memory_coordinator.resource_observer import ResourceObservation
@@ -50,7 +50,13 @@ class ARWorkloadClassifier:
         prompt_tokens: int,
         max_tokens: int,
         streaming: bool = False,
+        **_backend_specific: Any,
     ) -> str:
+        """``**_backend_specific`` absorbs and ignores any extra keyword
+        arguments a caller passes uniformly across classifier
+        implementations (e.g. TTS-specific ``task_type``/``language``), so
+        the scheduler mixin's call site does not need to branch on which
+        classifier is configured for a stage."""
         if prompt_tokens < 0 or max_tokens < 0:
             raise ValueError("workload classifier inputs must be non-negative")
         prompt_bucket = self._bucket(prompt_tokens, self.PROMPT_BUCKETS)

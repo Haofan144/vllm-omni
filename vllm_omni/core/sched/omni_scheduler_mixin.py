@@ -55,6 +55,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
@@ -145,7 +146,10 @@ class OmniSchedulerMixin:
         self._resource_admission_aging_stops = 0
         self._resource_observation_collector = ResourceObservationCollector()
         self._resource_calibrator = OnlineCalibrator()
-        self._ar_workload_classifier = ARWorkloadClassifier()
+        classifier_path = self._dynamic_hbm_config.ar_workload_classifier
+        self._ar_workload_classifier = (
+            resolve_obj_by_qualname(classifier_path)() if classifier_path else ARWorkloadClassifier()
+        )
         self._dynamic_hbm_ar_profile_store: ARProfileStore | None = None
         self._dynamic_hbm_ar_profile_loaded = False
         self._resource_observation_writer: ResourceObservationJSONLWriter | None = None
@@ -458,6 +462,46 @@ class OmniSchedulerMixin:
         self._dynamic_hbm_ar_profile_store = store
         return store
 
+    @staticmethod
+    def _tts_classify_extra_kwargs(request: Any) -> dict[str, Any]:
+        """Extract the TTS-specific classifier dimensions from a request's
+        ``additional_information``, when present.
+
+        ``TTSWorkloadClassifier.classify`` reads ``task_type``/
+        ``ref_audio_present``; ``ARWorkloadClassifier.classify`` ignores
+        unknown keyword arguments, so it is safe to always build and pass
+        this dict regardless of which classifier is configured -- the
+        scheduler mixin does not need to know which one is active.
+
+        Values in ``additional_information`` follow the batch-friendly,
+        single-element-list convention every TTS request-builder in
+        ``serving_speech.py`` uses (e.g. ``tts_params["task_type"] =
+        [request.task_type]``): unwrap a one-element list before reading it.
+        Missing/differently-shaped fields (e.g. a non-TTS model's
+        ``additional_information``) degrade to the classifier's own
+        defaults rather than raising.
+        """
+        payload = getattr(request, "additional_information", None)
+        if payload is None:
+            return {}
+        try:
+            info = deserialize_additional_information(payload)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return {}
+
+        def _unwrap(key: str) -> Any:
+            value = info.get(key)
+            if isinstance(value, list):
+                return value[0] if value else None
+            return value
+
+        task_type = _unwrap("task_type")
+        ref_audio_present = bool(_unwrap("ref_audio") or _unwrap("ref_code_length"))
+        return {
+            "task_type": task_type if isinstance(task_type, str) else None,
+            "ref_audio_present": ref_audio_present,
+        }
+
     def _ar_resource_context(self, request: Any) -> ARRequestResourceContext | None:
         """Build estimator input from scheduler state without hiding it in the estimator."""
         estimator = self._ar_resource_estimator()
@@ -475,6 +519,7 @@ class OmniSchedulerMixin:
             prompt_tokens=max(0, int(getattr(request, "num_prompt_tokens", 0))),
             max_tokens=max(0, int(getattr(request, "max_tokens", 0))),
             streaming=streaming,
+            **self._tts_classify_extra_kwargs(request),
         )
         profile = None
         store = self._ar_resource_profile_store(estimator.block_size)
