@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
+from vllm_omni.config.stage_config import StageExecutionType
 from vllm_omni.core.memory_coordinator import DynamicHBMConfig, SafetyState
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
@@ -24,6 +25,7 @@ class _Scheduler(OmniSchedulerMixin):
                 stage_id=0,
                 dynamic_hbm=config or {"enabled": True},
                 async_chunk=False,
+                stage_pipeline_config=SimpleNamespace(execution_type=StageExecutionType.LLM_AR),
             )
         )
         self._init_dynamic_hbm_scheduling_state()
@@ -179,6 +181,32 @@ def test_resource_admission_off_is_noop() -> None:
     decision = scheduler._dynamic_hbm_resource_admission_decision()
     assert decision.allowed
     assert decision.reason.value == "disabled"
+
+
+def test_resource_admission_declines_on_non_ar_execution_type() -> None:
+    # A Code2Wav/decoder-style LLM_GENERATION stage still exposes
+    # num_prompt_tokens/max_tokens on its Request objects (every vLLM Request
+    # has them), but those hold codec-frame placeholder counts, not text
+    # tokens. The AR estimator must decline rather than silently misapply KV
+    # accounting to them.
+    scheduler = _resource_scheduler("enforce", free_blocks=2)
+    scheduler.vllm_config.model_config.stage_pipeline_config.execution_type = (
+        StageExecutionType.LLM_GENERATION
+    )
+    decision = scheduler._dynamic_hbm_resource_admission_decision()
+    assert decision.allowed
+    assert decision.reason.value == "unsupported_execution_type"
+
+
+def test_resource_admission_declines_when_execution_type_unknown() -> None:
+    # Fail closed: a stage whose execution type cannot be determined at all
+    # (e.g. a minimal/legacy model_config missing stage_pipeline_config) must
+    # not be assumed AR by default.
+    scheduler = _resource_scheduler("enforce", free_blocks=2)
+    del scheduler.vllm_config.model_config.stage_pipeline_config
+    decision = scheduler._dynamic_hbm_resource_admission_decision()
+    assert decision.allowed
+    assert decision.reason.value == "unsupported_execution_type"
 
 
 class _WaitingRequestWithStalePrefillStats(_WaitingRequest):

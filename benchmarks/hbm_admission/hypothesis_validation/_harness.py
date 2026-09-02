@@ -303,11 +303,16 @@ class SchedulerHarness:
                 self.policy = SchedulingPolicy.FCFS
                 self.waiting = []
                 self.num_waiting_for_streaming_input = 0
+                from vllm_omni.config.stage_config import StageExecutionType
+
                 self.vllm_config = SimpleNamespace(
                     model_config=SimpleNamespace(
                         stage_id=0,
                         dynamic_hbm=config or {"enabled": True},
                         async_chunk=False,
+                        stage_pipeline_config=SimpleNamespace(
+                            execution_type=StageExecutionType.LLM_AR
+                        ),
                     )
                 )
                 self.cache_config = SimpleNamespace(block_size=block_size)

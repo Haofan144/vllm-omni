@@ -23,6 +23,7 @@ class AdmissionReason(StrEnum):
     ESTIMATOR_UNAVAILABLE = "estimator_unavailable"
     ESTIMATOR_ERROR = "estimator_error"
     HEAD_OF_LINE_AGED = "head_of_line_aged"
+    UNSUPPORTED_EXECUTION_TYPE = "unsupported_execution_type"
 
 
 @dataclass(frozen=True)

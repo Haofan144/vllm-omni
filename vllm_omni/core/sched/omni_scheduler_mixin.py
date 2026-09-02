@@ -356,6 +356,28 @@ class OmniSchedulerMixin:
         occupied_slots = len(self.running) + getattr(self, "num_waiting_for_streaming_input", 0)
         return occupied_slots < self._effective_max_num_seqs
 
+    def _dynamic_hbm_ar_estimator_applies(self) -> bool:
+        """Whether this stage's requests are genuine AR text/output tokens.
+
+        ``ARResourceEstimator`` is only meaningful for an ``LLM_AR`` stage.
+        Other execution types (e.g. ``LLM_GENERATION`` Code2Wav/decoder
+        stages) still expose ``request.num_prompt_tokens``/``max_tokens`` --
+        every vLLM ``Request`` has them -- but those fields hold codec-frame
+        or other backend-specific placeholder counts, not text tokens, so
+        applying AR KV-block accounting to them would be silently wrong
+        rather than loudly unsupported. Stages whose execution type cannot be
+        determined are treated as unsupported (fail closed to "don't apply
+        the AR estimator") rather than assumed AR.
+        """
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        stage_pipeline_config = getattr(model_config, "stage_pipeline_config", None)
+        execution_type = getattr(stage_pipeline_config, "execution_type", None)
+        if execution_type is None:
+            return False
+        from vllm_omni.config.stage_config import StageExecutionType
+
+        return execution_type == StageExecutionType.LLM_AR
+
     def _ar_resource_estimator(self) -> Any:
         """Lazily build (and cache) the AR KV-block estimator for this replica.
 
@@ -630,6 +652,18 @@ class OmniSchedulerMixin:
             request = next(iter(waiting), None) if waiting else None
         if request is None:
             decision = AdmissionDecision(True, AdmissionReason.EMPTY_QUEUE)
+            if record:
+                self._record_resource_admission_decision(decision)
+            return decision
+        if not self._dynamic_hbm_ar_estimator_applies():
+            # ARResourceEstimator/ARWorkloadClassifier read request.num_prompt_tokens
+            # / request.max_tokens as AR text-token counts. A non-AR generation
+            # stage (e.g. a Code2Wav decoder) still exposes those same Request
+            # attributes, but they hold codec-frame-derived placeholder counts --
+            # feeding them to the AR estimator would silently produce a
+            # nonsensical (not an error) admission signal instead of failing
+            # loudly. Decline before ever building an AR context for this stage.
+            decision = AdmissionDecision(True, AdmissionReason.UNSUPPORTED_EXECUTION_TYPE)
             if record:
                 self._record_resource_admission_decision(decision)
             return decision
