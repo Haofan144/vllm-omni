@@ -43,8 +43,13 @@ but unvalidated -- do not use it to size a real deployment.
 
 from __future__ import annotations
 
+import atexit
+import json
 import math
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from vllm_omni.core.memory_coordinator.resource_estimator import (
@@ -272,3 +277,164 @@ class Code2WavResourceEstimator:
                 fallback_reason=fallback_reason,
             ),
         )
+
+
+@dataclass(frozen=True)
+class Code2WavObservation:
+    """One real ``batched_chunked_decode`` forward call's ground truth.
+
+    Unlike AR's ``ResourceObservation`` (a per-request lifetime with a
+    begin/observe/finish arc, since a request's KV footprint accumulates
+    across many scheduler steps), Code2Wav's real cost is a per-*forward-call*
+    quantity (the module docstring's "cost ~= f(batch_size *
+    max_frames_in_batch)"): one call, one batch shape, one peak. There is no
+    lifetime to track, so this is a flat record, not a collector with
+    request-keyed state.
+    """
+
+    batch_size: int
+    batch_max_frame_count: int
+    persistent_state_active: bool
+    peak_transient_bytes: int
+    finished_monotonic_s: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 1 or self.batch_max_frame_count < 0:
+            raise ValueError("Code2Wav observation batch fields are invalid")
+        if self.peak_transient_bytes < 0:
+            raise ValueError("Code2Wav observation peak_transient_bytes must be non-negative")
+
+
+def measure_code2wav_forward_peak_bytes(
+    decode_fn,
+    *args: Any,
+    device: Any = None,
+    **kwargs: Any,
+) -> tuple[Any, int]:
+    """Run ``decode_fn(*args, **kwargs)`` and return ``(result,
+    peak_bytes_delta)``, where ``peak_bytes_delta`` is the CUDA allocator's
+    peak-allocated-bytes high-water mark *during the call*, measured against
+    the allocation level just before the call (not the process-lifetime
+    absolute peak, which would double-count whatever the batch already held
+    resident from prior steps -- see the module docstring's persistent-state
+    caveat for why that distinction matters for streaming sessions).
+
+    Caller decides *whether* to invoke this at all (an opt-in env-var gate at
+    the model-forward call site, mirroring the existing
+    ``VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS`` convention) -- this function
+    itself has no notion of sampling rate or overhead budget; every call
+    pays a ``torch.cuda.synchronize()`` + stat-reset cost, so it must not run
+    on every production forward pass in a hot loop.
+    """
+    import torch
+
+    target_device = device if device is not None else torch.cuda.current_device()
+    torch.cuda.synchronize(target_device)
+    baseline_allocated = torch.cuda.memory_allocated(target_device)
+    torch.cuda.reset_peak_memory_stats(target_device)
+    result = decode_fn(*args, **kwargs)
+    torch.cuda.synchronize(target_device)
+    peak_allocated = torch.cuda.max_memory_allocated(target_device)
+    return result, max(0, peak_allocated - baseline_allocated)
+
+
+class Code2WavObservationJSONLWriter:
+    """Bounded-batch append writer for Code2Wav shadow observations.
+
+    Mirrors ``ResourceObservationJSONLWriter`` (same flush-batching,
+    thread-safety, and atexit-flush shape) but over ``Code2WavObservation``
+    rows instead of AR's per-request ``ResourceObservation``.
+    """
+
+    def __init__(self, path: str | Path, flush_size: int = 1) -> None:
+        if flush_size < 1:
+            raise ValueError("flush_size must be positive")
+        self.path = Path(path)
+        self.flush_size = flush_size
+        self._pending: list[Code2WavObservation] = []
+        self._lock = Lock()
+        atexit.register(self.flush)
+
+    def append(self, observation: Code2WavObservation) -> None:
+        with self._lock:
+            self._pending.append(observation)
+            if len(self._pending) >= self.flush_size:
+                self._flush_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if not self._pending:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as output:
+            for observation in self._pending:
+                output.write(json.dumps(asdict(observation), sort_keys=True) + "\n")
+            output.flush()
+        self._pending.clear()
+
+
+def read_code2wav_observations_jsonl(path: str | Path) -> list[Code2WavObservation]:
+    observations = []
+    with Path(path).open(encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                observations.append(Code2WavObservation(**json.loads(line)))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid Code2Wav observation at {path}:{line_number}: {exc}"
+                ) from exc
+    return observations
+
+
+def build_code2wav_envelope_profiles(
+    observations: list[Code2WavObservation],
+    *,
+    fingerprint: ProfileFingerprint,
+    classifier: Code2WavWorkloadClassifier | None = None,
+    min_samples: int = 1,
+    persistent_bytes_per_request: int = 0,
+) -> list[Code2WavEnvelopeProfile]:
+    """Group real observations by their (batch, frame) bucket and take the
+    MAX observed transient peak per bucket -- an empirical peak is itself a
+    lower bound on a true worst case, so a profile must report the highest
+    peak actually seen, never a mean/median that a future request in the
+    same bucket could exceed.
+
+    ``persistent_bytes_per_request`` is not derivable from
+    ``peak_transient_bytes`` (persistent state is additive across a
+    streaming session's lifetime, not a per-forward-call peak) -- pass a
+    separately-measured value, or leave at the conservative-if-unmeasured
+    default of 0 (which is only safe when no observation in this batch has
+    ``persistent_state_active=True``; this function does not silently
+    validate that for the caller).
+    """
+    if min_samples < 1:
+        raise ValueError("min_samples must be positive")
+    active_classifier = classifier or Code2WavWorkloadClassifier()
+    grouped: dict[tuple[int, int], list[Code2WavObservation]] = {}
+    for observation in observations:
+        key = active_classifier.bucket_key(
+            batch_size=observation.batch_size,
+            frame_count=observation.batch_max_frame_count,
+        )
+        grouped.setdefault(key, []).append(observation)
+    profiles = []
+    for (batch_bucket, frame_bucket), rows in sorted(grouped.items()):
+        if len(rows) < min_samples:
+            continue
+        profiles.append(
+            Code2WavEnvelopeProfile(
+                fingerprint=fingerprint,
+                batch_size_bucket=batch_bucket,
+                frame_count_bucket=frame_bucket,
+                sample_count=len(rows),
+                peak_transient_bytes=max(row.peak_transient_bytes for row in rows),
+                persistent_bytes_per_request=persistent_bytes_per_request,
+            )
+        )
+    return profiles

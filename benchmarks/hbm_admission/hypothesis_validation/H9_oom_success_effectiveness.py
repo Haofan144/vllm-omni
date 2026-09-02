@@ -143,14 +143,20 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
 
 
 def _shared_cli(args: argparse.Namespace) -> list[str]:
-    return [
+    cli = [
         "--output-dir", str(args.output_dir), "--model", str(args.model),
         "--deploy-config", str(args.deploy_config), "--dataset-path", str(args.dataset_path),
         "--device", str(args.device), "--port", str(args.port),
         "--num-prompts", str(args.num_prompts), "--num-warmups", str(args.num_warmups),
         "--max-num-seqs", str(args.max_num_seqs), "--pressure-reserve-mib", str(args.pressure_reserve_mib),
+        "--pressure-critical-seconds", str(args.pressure_critical_seconds),
         "--startup-timeout", str(args.startup_timeout), "--benchmark-timeout", str(args.benchmark_timeout),
     ]
+    for extra in args.server_extra_arg:
+        # --opt=value form: argparse rejects a flag-like value as a
+        # separate token (e.g. --stage-overrides).
+        cli.append(f"--server-extra-arg={extra}")
+    return cli
 
 
 def run_calibration(args: argparse.Namespace) -> int:
@@ -191,6 +197,8 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--device", type=int, default=0); item.add_argument("--port", type=int, default=8000)
         item.add_argument("--num-prompts", type=int, default=240); item.add_argument("--num-warmups", type=int, default=4)
         item.add_argument("--max-num-seqs", type=int, default=32); item.add_argument("--pressure-reserve-mib", type=int, default=512)
+        item.add_argument("--pressure-critical-seconds", type=float, default=15.0)
+        item.add_argument("--server-extra-arg", action="append", default=[])
         item.add_argument("--startup-timeout", type=int, default=1800); item.add_argument("--benchmark-timeout", type=int, default=3600)
     calibration.add_argument("--critical-targets", type=float, nargs="+", default=[0.93, 0.95, 0.97])
     calibration.add_argument("--concurrencies", type=int, nargs="+", default=[16, 24, 32])

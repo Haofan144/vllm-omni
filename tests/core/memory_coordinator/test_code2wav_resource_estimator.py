@@ -4,10 +4,12 @@ import pytest
 
 from vllm_omni.core.memory_coordinator.code2wav_resource_estimator import (
     Code2WavEnvelopeProfile,
+    Code2WavObservation,
     Code2WavProfileStore,
     Code2WavRequestContext,
     Code2WavResourceEstimator,
     Code2WavWorkloadClassifier,
+    build_code2wav_envelope_profiles,
 )
 from vllm_omni.core.memory_coordinator.resource_estimator import ResourceDimension
 from vllm_omni.core.memory_coordinator.resource_profile import ProfileFingerprint
@@ -137,3 +139,63 @@ def test_profile_estimate_is_capped_at_hard_bound() -> None:
 def test_profile_store_returns_none_with_no_profiles() -> None:
     store = Code2WavProfileStore()
     assert store.get_ceiling(batch_size_bucket=1, frame_count_bucket=25) is None
+
+
+def test_observation_rejects_invalid_fields() -> None:
+    with pytest.raises(ValueError, match="batch fields are invalid"):
+        Code2WavObservation(
+            batch_size=0, batch_max_frame_count=10, persistent_state_active=False, peak_transient_bytes=1
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        Code2WavObservation(
+            batch_size=1, batch_max_frame_count=10, persistent_state_active=False, peak_transient_bytes=-1
+        )
+
+
+def test_build_envelope_profiles_takes_max_peak_per_bucket() -> None:
+    observations = [
+        Code2WavObservation(
+            batch_size=3, batch_max_frame_count=20, persistent_state_active=False, peak_transient_bytes=500
+        ),
+        Code2WavObservation(
+            batch_size=4, batch_max_frame_count=24, persistent_state_active=False, peak_transient_bytes=900
+        ),
+        Code2WavObservation(
+            batch_size=3, batch_max_frame_count=10, persistent_state_active=False, peak_transient_bytes=100
+        ),
+    ]
+    profiles = build_code2wav_envelope_profiles(observations, fingerprint=_FINGERPRINT, min_samples=1)
+    # All three observations bucket to (batch<=4, frame<=25) -- the profile's
+    # peak must be the MAX observed peak in that bucket, not a mean, since an
+    # empirical peak is a lower bound on the true worst case.
+    assert len(profiles) == 1
+    assert profiles[0].batch_size_bucket == 4
+    assert profiles[0].frame_count_bucket == 25
+    assert profiles[0].peak_transient_bytes == 900
+    assert profiles[0].sample_count == 3
+
+
+def test_build_envelope_profiles_respects_min_samples() -> None:
+    observations = [
+        Code2WavObservation(
+            batch_size=1, batch_max_frame_count=10, persistent_state_active=False, peak_transient_bytes=100
+        )
+    ]
+    profiles = build_code2wav_envelope_profiles(observations, fingerprint=_FINGERPRINT, min_samples=2)
+    assert profiles == []
+
+
+def test_built_profile_feeds_estimator_and_replaces_placeholder() -> None:
+    observations = [
+        Code2WavObservation(
+            batch_size=4, batch_max_frame_count=25, persistent_state_active=False, peak_transient_bytes=777
+        )
+        for _ in range(5)
+    ]
+    profiles = build_code2wav_envelope_profiles(observations, fingerprint=_FINGERPRINT, min_samples=1)
+    store = Code2WavProfileStore(profiles)
+    estimator = Code2WavResourceEstimator()
+    context = Code2WavRequestContext(frame_count=20, batch_size=3, batch_max_frame_count=25)
+    estimate = estimator.estimate(context, store)
+    assert estimate.provenance.fallback_reason is None
+    assert estimate.physical.quantile_transient_peak_bytes == 777

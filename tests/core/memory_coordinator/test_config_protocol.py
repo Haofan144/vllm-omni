@@ -80,6 +80,9 @@ def test_resource_profile_path_requires_device_fingerprint() -> None:
         {"resource_target_coverage": 1.1},
         {"resource_profile_min_samples": 0},
         {"resource_observation_flush_size": 0},
+        {"resource_uncertainty_min_samples": 0},
+        {"resource_uncertainty_low_sample_multiplier": 0.99},
+        {"resource_uncertainty_stale_multiplier": 0.5},
     ],
 )
 def test_resource_profile_config_rejects_invalid_values(value) -> None:

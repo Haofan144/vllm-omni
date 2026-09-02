@@ -249,7 +249,7 @@ def write_summary(path: Path, report: dict[str, Any]) -> None:
 
 
 def common_command(args: argparse.Namespace, output_dir: Path, *, repeats: int, concurrency: int, critical: float) -> list[str]:
-    return [
+    command = [
         sys.executable, str(BASE_RUNNER), "--output-dir", str(output_dir),
         "--model", str(args.model), "--deploy-config", str(args.deploy_config),
         "--dataset-path", str(args.dataset_path), "--device", str(args.device),
@@ -265,11 +265,17 @@ def common_command(args: argparse.Namespace, output_dir: Path, *, repeats: int, 
         "--recovery-complete-samples", "3", "--pressure-trigger-mode", "first-response",
         "--pressure-baseline-seconds", "8", "--pressure-high-target", "0.84",
         "--pressure-high-seconds", "10", "--pressure-critical-target", str(critical),
-        "--pressure-critical-seconds", "15", "--pressure-recovery-target", "0.76",
+        "--pressure-critical-seconds", str(args.pressure_critical_seconds),
+        "--pressure-recovery-target", "0.76",
         "--pressure-recovery-seconds", "15", "--pressure-post-release-seconds", "30",
         "--pressure-chunk-mib", "64", "--pressure-reserve-mib", str(args.pressure_reserve_mib),
         "--startup-timeout", str(args.startup_timeout), "--benchmark-timeout", str(args.benchmark_timeout),
     ]
+    for extra in args.server_extra_arg:
+        # Use the --opt=value form: argparse rejects a flag-like value
+        # (e.g. --stage-overrides) supplied as a separate token.
+        command.append(f"--server-extra-arg={extra}")
+    return command
 
 
 def run_allowing_expected_failures(command: list[str], log_path: Path) -> int:
@@ -331,6 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--num-warmups", type=int, default=4)
         item.add_argument("--max-num-seqs", type=int, default=32)
         item.add_argument("--pressure-reserve-mib", type=int, default=512)
+        item.add_argument("--pressure-critical-seconds", type=float, default=15.0)
+        item.add_argument("--server-extra-arg", action="append", default=[])
         item.add_argument("--startup-timeout", type=int, default=1800)
         item.add_argument("--benchmark-timeout", type=int, default=3600)
     calibration = sub.add_parser("calibrate")

@@ -155,6 +155,17 @@ def prepare_config(args: argparse.Namespace, arm: Arm, case_dir: Path) -> Path:
             "scale_up_step": args.scale_up_step,
             "scale_up_stable_samples": args.scale_up_stable_samples,
         }
+        if args.resource_observation:
+            stage["dynamic_hbm"].update(
+                {
+                    "resource_admission_mode": "shadow",
+                    "resource_observation_path": str(
+                        case_dir
+                        / "resource_observations.stage-{stage_id}.replica-{replica_id}.pid-{pid}.jsonl"
+                    ),
+                    "resource_observation_flush_size": args.resource_observation_flush_size,
+                }
+            )
     if selected is not None and found != selected:
         raise ValueError(f"dynamic stage IDs absent from deploy config: {sorted(selected - found)}")
     path = case_dir / "deploy.yaml"
@@ -838,6 +849,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release-threshold-mib", type=int, default=1024)
     parser.add_argument("--safetensors-load-strategy", default="prefetch")
     parser.add_argument("--server-extra-arg", action="append", default=[])
+    parser.add_argument(
+        "--resource-observation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="export M2 shadow resource observations into each case directory",
+    )
+    parser.add_argument("--resource-observation-flush-size", type=int, default=1)
     parser.add_argument("--arms", nargs="+", choices=[arm.name for arm in CORE_ARMS])
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
@@ -857,6 +875,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("guard-ratio must be in [0, 1)")
     if args.immediate_sample_min_interval_ms < 1:
         parser.error("immediate-sample-min-interval-ms must be positive")
+    if args.resource_observation_flush_size < 1:
+        parser.error("resource-observation-flush-size must be positive")
     return args
 
 

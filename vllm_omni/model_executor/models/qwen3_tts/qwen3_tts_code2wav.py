@@ -85,6 +85,22 @@ class Qwen3TTSCode2Wav(nn.Module):
             "on",
         )
         self._batch_stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0") or 0)
+        # M2c real-GPU profiling (opt-in, off by default): measures the CUDA
+        # allocator's peak-bytes high-water mark across each
+        # batched_chunked_decode call and appends one Code2WavObservation row
+        # per forward call to VLLM_OMNI_QWEN3_CODE2WAV_MEMORY_TRACE_PATH. This
+        # is the real-observation counterpart to the estimator's placeholder
+        # byte constants (see code2wav_resource_estimator.py's module
+        # docstring) -- every measured call pays a cuda synchronize + stat
+        # reset, so this must stay opt-in and never run by default.
+        self._memory_trace_writer = None
+        memory_trace_path = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_MEMORY_TRACE_PATH")
+        if memory_trace_path:
+            from vllm_omni.core.memory_coordinator.code2wav_resource_estimator import (
+                Code2WavObservationJSONLWriter,
+            )
+
+            self._memory_trace_writer = Code2WavObservationJSONLWriter(memory_trace_path)
         self._batch_stats_forwards = 0
         self._batch_stats_groups = 0
         self._batch_stats_requests = 0
@@ -460,14 +476,39 @@ class Qwen3TTSCode2Wav(nn.Module):
             bucket_frames=max_request_length,
             actual_frames=request_lengths,
         )
-        request_wavs = decoder.batched_chunked_decode(
-            request_codes,
-            request_lengths,
-            caches=request_states,
-            chunk_size=self._decode_chunk_frames,
-            left_context_size=self._decode_left_context_frames,
-            max_batch_size=self._decode_batch_max_size,
-        )
+        if self._memory_trace_writer is not None:
+            from vllm_omni.core.memory_coordinator.code2wav_resource_estimator import (
+                Code2WavObservation,
+                measure_code2wav_forward_peak_bytes,
+            )
+
+            request_wavs, peak_bytes = measure_code2wav_forward_peak_bytes(
+                decoder.batched_chunked_decode,
+                request_codes,
+                request_lengths,
+                caches=request_states,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+                max_batch_size=self._decode_batch_max_size,
+                device=request_codes.device,
+            )
+            self._memory_trace_writer.append(
+                Code2WavObservation(
+                    batch_size=len(valid_codes_qf),
+                    batch_max_frame_count=max_request_length,
+                    persistent_state_active=request_states is not None,
+                    peak_transient_bytes=peak_bytes,
+                )
+            )
+        else:
+            request_wavs = decoder.batched_chunked_decode(
+                request_codes,
+                request_lengths,
+                caches=request_states,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+                max_batch_size=self._decode_batch_max_size,
+            )
         if len(request_wavs) != len(valid_codes_qf):
             raise ValueError(
                 f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"

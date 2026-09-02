@@ -44,6 +44,7 @@ from vllm_omni.core.memory_coordinator import (
     ResourceObservationJSONLWriter,
     SafetyState,
     evaluate_ar_kv_admission,
+    uncertainty_multiplier,
 )
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -844,11 +845,19 @@ class OmniSchedulerMixin:
                 workload_class=context.workload_class,
                 profile_version=context.profile_version,
             )
+            margin = uncertainty_multiplier(
+                snapshot,
+                fallback_reason=estimate.provenance.fallback_reason,
+                min_samples_for_full_confidence=config.resource_uncertainty_min_samples,
+                low_sample_multiplier=config.resource_uncertainty_low_sample_multiplier,
+                stale_multiplier=config.resource_uncertainty_stale_multiplier,
+            )
             decision = evaluate_ar_kv_admission(
                 estimate,
                 free_kv_blocks=block_pool.get_num_free_blocks(),
                 enforce=config.resource_admission_mode == "enforce",
                 correction=snapshot.correction,
+                uncertainty_multiplier=margin,
             )
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             logger.warning("AR resource estimation failed; leaving admission to safety guard: %s", exc)

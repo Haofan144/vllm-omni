@@ -112,3 +112,49 @@ class OnlineCalibrator:
         return CalibrationSnapshot(
             correction=correction, sample_count=sample_count, stale=False
         )
+
+
+def uncertainty_multiplier(
+    snapshot: CalibrationSnapshot,
+    *,
+    fallback_reason: str | None,
+    min_samples_for_full_confidence: int = 30,
+    low_sample_multiplier: float = 1.15,
+    stale_multiplier: float = 1.15,
+) -> float:
+    """Safety margin on top of a (possibly calibrated) quantile estimate.
+
+    M2 design doc S11.3/S11.4: admission demand is the quantile peak scaled
+    by both the online calibration ``correction`` *and* this multiplier,
+    which is deliberately NOT a single opaque "confidence" float (S11.3
+    explicitly rules that out) -- it is a fixed 1.0 unless one of two
+    concrete, individually-inspectable conditions holds:
+
+    * ``sample_count < min_samples_for_full_confidence``: the calibrator has
+      not yet seen enough completed requests for this workload class to
+      trust its correction fully, so demand a modest extra margin. This is a
+      *different, coarser* gate than ``OnlineCalibrator``'s own
+      ``min_samples`` (which decides whether to apply any correction at
+      all) -- a class can clear the calibrator's lower bar and still be in
+      this "seen some evidence, not yet a lot" band.
+    * ``snapshot.stale``: the calibrator has valid sample history but it is
+      old enough that ``snapshot()`` already fell back to a neutral 1.0
+      correction; layering an extra margin here (rather than silently
+      trusting the neutral value as if nothing were known) reflects that a
+      stale profile is closer to "unknown-ish" than to "freshly validated".
+
+    A ``fallback_reason`` (the estimator had no profile at all, so ``quantile
+    == hard`` already) needs no additional margin -- the hard bound is
+    already the request's own conservative worst case; stacking a multiplier
+    on top of it would inflate demand past a value the request could ever
+    actually need, which is exactly the "over-conservative capacity loss"
+    the M2 design doc's research question 2 is trying to avoid.
+    """
+    if fallback_reason is not None:
+        return 1.0
+    multiplier = 1.0
+    if snapshot.sample_count < min_samples_for_full_confidence:
+        multiplier *= low_sample_multiplier
+    if snapshot.stale:
+        multiplier *= stale_multiplier
+    return multiplier

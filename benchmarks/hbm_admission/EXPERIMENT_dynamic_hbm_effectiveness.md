@@ -43,31 +43,65 @@ not deterministic failure probability.  Select a point satisfying:
 ```
 
 The sidecar's `allocation_oom_count` must remain zero.  Do not use calibration
-runs in the formal result.  A useful starting sweep on a 48 GiB A6000 is:
+runs in the formal result.
+
+**A pressure sidecar alone cannot create the danger cell on the stock deploy.**
+`qwen3_tts.yaml` gives the talker an ~11.8 GiB / 110k-token KV pool (~27x
+headroom for a 4096-token request), physically pre-allocated at startup.  vLLM
+issues no new large allocations during decode, so the sidecar only consumes
+*unused* transient headroom and never starves vLLM.  The first real sweep
+(concurrency {16,24,32} x critical-target {0.93,0.95,0.97}) produced
+`failure_rate == 0.0` in every cell for exactly this reason.
+
+**Scheme A — shrink the talker KV pool, then overload it.**  Pass
+`--stage-overrides` through `--server-extra-arg` (forwarded end to end) to drop
+stage-0 `gpu_memory_utilization` so the KV pool becomes a genuine bottleneck,
+use the long-text dataset, and stretch the critical window:
 
 ```bash
 .venv/bin/python benchmarks/hbm_admission/run_dynamic_hbm_effectiveness.py \
-  calibrate --output-dir benchmarks/results/hbm_effectiveness_calibration \
-  --critical-targets 0.93 0.95 0.97 \
-  --concurrencies 16 24 32 --repeats 3
+  calibrate --output-dir benchmarks/results/hbm_effectiveness_calibration_v2 \
+  --dataset-path benchmarks/build_dataset/seed_tts_long \
+  --critical-targets 0.88 0.90 --concurrencies 32 40 48 56 \
+  --max-num-seqs 48 --pressure-critical-seconds 45 --pressure-reserve-mib 256 \
+  --num-prompts 320 --repeats 3 \
+  --server-extra-arg=--stage-overrides \
+  '--server-extra-arg={"0":{"gpu_memory_utilization":0.11},"1":{"gpu_memory_utilization":0.10}}'
 ```
 
-If all cells survive, reduce `--pressure-reserve-mib`, increase request size
-or use a mixed/long dataset.  If every cell fails before a controller could
-react, increase the reserve or slow the pressure ramp.  The desired final HBM
-increment must be caused by admitted inference work; a sidecar that OOMs does
-not demonstrate admission-control effectiveness.
+Note the `=` form: argparse rejects `--server-extra-arg --stage-overrides`
+(flag-like value as a separate token).
+
+Fallback ladder if no cell lands in `[0.30, 0.80]`:
+
+1. stage-0 `gpu_memory_utilization` 0.11 -> 0.09; add `--concurrencies 64`.
+2. `{"0":{"hbm_limit_gb":2.0,"hbm_admission_guard":false}}` — a hard KV cap with
+   the static admission guard disabled (`hbm_limit_gb` alone auto-enables that
+   guard, which would protect arm C and erase the C-vs-D contrast).
+3. longer `seed_tts_long` paragraphs; `--pressure-critical-seconds 60`.
+4. a cell above 0.80, sidecar OOM, or arm D also failing -> stage-0
+   `gpu_memory_utilization` up a notch, `--pressure-reserve-mib 512`, or shorter
+   paragraphs.
+
+The desired final HBM increment must be caused by admitted inference work; a
+sidecar that OOMs does not demonstrate admission-control effectiveness.
 
 ## Phase 2: frozen formal comparison
 
 Freeze one calibrated pressure target and workload before running the formal
-comparison.  Use at least 20 repetitions:
+comparison.  Carry the **same** `--dataset-path`, `--stage-overrides`,
+`--max-num-seqs`, and `--pressure-*` values that qualified the cell.  Use at
+least 20 repetitions:
 
 ```bash
 .venv/bin/python benchmarks/hbm_admission/run_dynamic_hbm_effectiveness.py \
-  formal --output-dir benchmarks/results/hbm_effectiveness_formal \
-  --critical-target 0.95 --concurrency 24 --repeats 20 \
-  --num-prompts 240 --fixed-cap 4
+  formal --output-dir benchmarks/results/hbm_effectiveness_formal_v2 \
+  --dataset-path benchmarks/build_dataset/seed_tts_long \
+  --critical-target <p> --concurrency <c> --repeats 20 \
+  --max-num-seqs 48 --pressure-critical-seconds 45 --pressure-reserve-mib 256 \
+  --num-prompts 320 --fixed-cap 4 \
+  --server-extra-arg=--stage-overrides \
+  '--server-extra-arg={"0":{"gpu_memory_utilization":<frozen>},"1":{"gpu_memory_utilization":0.10}}'
 ```
 
 The command writes the underlying per-case artifacts plus

@@ -7,7 +7,9 @@ from vllm_omni.core.memory_coordinator import (
     ARResourceEstimator,
     OnlineCalibrator,
     ResourceObservationCollector,
+    uncertainty_multiplier,
 )
+from vllm_omni.core.memory_coordinator.resource_calibrator import CalibrationSnapshot
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -173,3 +175,51 @@ def test_invalid_constructor_args_are_rejected() -> None:
         OnlineCalibrator(min_samples=0)
     with pytest.raises(ValueError):
         OnlineCalibrator(stale_after_s=0)
+
+
+def test_uncertainty_multiplier_is_neutral_on_fallback() -> None:
+    # A fallback estimate (quantile == hard already) must not get an
+    # additional margin stacked on top of its own worst-case bound.
+    snapshot = CalibrationSnapshot(correction=1.0, sample_count=0, stale=False)
+    assert uncertainty_multiplier(snapshot, fallback_reason="output_length_profile_unavailable") == 1.0
+
+
+def test_uncertainty_multiplier_is_neutral_with_full_confidence() -> None:
+    snapshot = CalibrationSnapshot(correction=1.2, sample_count=100, stale=False)
+    assert uncertainty_multiplier(snapshot, fallback_reason=None, min_samples_for_full_confidence=30) == 1.0
+
+
+def test_uncertainty_multiplier_applies_low_sample_margin() -> None:
+    snapshot = CalibrationSnapshot(correction=1.0, sample_count=5, stale=False)
+    margin = uncertainty_multiplier(
+        snapshot,
+        fallback_reason=None,
+        min_samples_for_full_confidence=30,
+        low_sample_multiplier=1.15,
+        stale_multiplier=1.15,
+    )
+    assert margin == pytest.approx(1.15)
+
+
+def test_uncertainty_multiplier_applies_stale_margin() -> None:
+    snapshot = CalibrationSnapshot(correction=1.0, sample_count=100, stale=True)
+    margin = uncertainty_multiplier(
+        snapshot,
+        fallback_reason=None,
+        min_samples_for_full_confidence=30,
+        low_sample_multiplier=1.15,
+        stale_multiplier=1.2,
+    )
+    assert margin == pytest.approx(1.2)
+
+
+def test_uncertainty_multiplier_stacks_both_margins() -> None:
+    snapshot = CalibrationSnapshot(correction=1.0, sample_count=1, stale=True)
+    margin = uncertainty_multiplier(
+        snapshot,
+        fallback_reason=None,
+        min_samples_for_full_confidence=30,
+        low_sample_multiplier=1.15,
+        stale_multiplier=1.2,
+    )
+    assert margin == pytest.approx(1.15 * 1.2)

@@ -59,6 +59,17 @@ class DynamicHBMConfig:
     # dimensions a plain text-LLM classifier has no notion of. None keeps the
     # default ARWorkloadClassifier.
     ar_workload_classifier: str | None = None
+    # Uncertainty multiplier (M2 design doc S11.3/S11.4): a safety margin
+    # layered on top of the calibrated quantile estimate, applied only when
+    # a profile exists (no margin is added on top of an already-conservative
+    # hard-bound fallback -- see uncertainty_multiplier()'s docstring).
+    # ``resource_uncertainty_min_samples`` is a coarser, separate threshold
+    # than OnlineCalibrator's own min_samples: a workload class can be
+    # trusted enough to apply *some* correction while still being short of
+    # "seen enough evidence for full confidence".
+    resource_uncertainty_min_samples: int = 30
+    resource_uncertainty_low_sample_multiplier: float = 1.15
+    resource_uncertainty_stale_multiplier: float = 1.15
 
     def __post_init__(self) -> None:
         if self.min_num_seqs < 1:
@@ -121,6 +132,18 @@ class DynamicHBMConfig:
         if self.resource_admission_bypass_aging_ms <= 0:
             raise ValueError(
                 "dynamic_hbm.resource_admission_bypass_aging_ms must be positive"
+            )
+        if self.resource_uncertainty_min_samples < 1:
+            raise ValueError(
+                "dynamic_hbm.resource_uncertainty_min_samples must be positive"
+            )
+        if self.resource_uncertainty_low_sample_multiplier < 1.0:
+            raise ValueError(
+                "dynamic_hbm.resource_uncertainty_low_sample_multiplier must be >= 1.0"
+            )
+        if self.resource_uncertainty_stale_multiplier < 1.0:
+            raise ValueError(
+                "dynamic_hbm.resource_uncertainty_stale_multiplier must be >= 1.0"
             )
 
     @classmethod
