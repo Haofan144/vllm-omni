@@ -12,7 +12,7 @@ import importlib.util
 import logging
 from pathlib import Path
 import sys
-from types import SimpleNamespace as ns
+from types import SimpleNamespace as Ns
 import unittest
 from unittest.mock import patch
 
@@ -29,20 +29,20 @@ def load(name, path):
 
 budget = load("_static_hbm_test_budget", "vllm_omni/config/static_budget.py")
 with patch.dict(sys.modules, {
-    "vllm.logger": ns(init_logger=logging.getLogger),
-    "vllm.utils.mem_utils": ns(format_gib=lambda n: n / 1024**3),
+    "vllm.logger": Ns(init_logger=logging.getLogger),
+    "vllm.utils.mem_utils": Ns(format_gib=lambda n: n / 1024**3),
 }):
     admission = load("_static_hbm_test_admission", "vllm_omni/engine/stage_admission.py")
 G = 1024**3
 
 
 def replica(stage, limit, devices, diffusion=False):
-    return ns(
-        metadata=ns(stage_id=stage), replica_id=0, devices=devices,
-        stage_cfg=ns(engine_args={"hbm_limit_gb": limit, "hbm_reserved_gb": 2, "diffusion_kv_mode": "paged_scheduler"}),
-        stage_vllm_config=None if diffusion else ns(
-            model_config=ns(hbm_limit_gb=limit, hbm_reserved_gb=2),
-            cache_config=ns(gpu_memory_utilization=0.9),
+    return Ns(
+        metadata=Ns(stage_id=stage), replica_id=0, devices=devices,
+        stage_cfg=Ns(engine_args={"hbm_limit_gb": limit, "hbm_reserved_gb": 2, "diffusion_kv_mode": "paged_scheduler"}),
+        stage_vllm_config=None if diffusion else Ns(
+            model_config=Ns(hbm_limit_gb=limit, hbm_reserved_gb=2),
+            cache_config=Ns(gpu_memory_utilization=0.9),
         ),
     )
 
@@ -51,7 +51,7 @@ class StaticBudgetTests(unittest.TestCase):
     def check(self, replicas):
         with patch.dict(sys.modules, {"vllm_omni.config.static_budget": budget}):
             return admission.check_admission(
-                [ns(replicas=replicas)],
+                [Ns(replicas=replicas)],
                 resolve_physical_devices=lambda r: r.devices,
                 device_total_memory=lambda _: 80 * G,
             )
@@ -150,20 +150,20 @@ class WorkerBudgetTests(unittest.TestCase):
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "determine_available_memory")
         method.decorator_list = []
         namespace = {
-            "logger": ns(debug=lambda *a, **k: None, info=lambda *a, **k: None,
+            "logger": Ns(debug=lambda *a, **k: None, info=lambda *a, **k: None,
                          info_once=lambda *a, **k: None),
-            "os": ns(getpid=lambda: 1), "format_gib": lambda n: n / G,
-            "current_omni_platform": ns(is_rocm=lambda: False),
-            "memory_profiling": lambda *a, **k: nullcontext(ns(
+            "os": Ns(getpid=lambda: 1), "format_gib": lambda n: n / G,
+            "current_omni_platform": Ns(is_rocm=lambda: False),
+            "memory_profiling": lambda *a, **k: nullcontext(Ns(
                 non_torch_increase=G, torch_peak_increase=3 * G, total_consumed=14 * G,
             )),
         }
         exec(compile(ast.Module(body=[method], type_ignores=[]), "worker/base.py", "exec"), namespace)
         calls = []
-        worker = ns(
-            vllm_config=ns(model_config=ns(hbm_limit_gb=total, hbm_reserved_gb=2, stage_id=0)),
-            cache_config=ns(kv_cache_memory_bytes=explicit),
-            model_runner=ns(model_memory_usage=10 * G, profile_run=lambda: calls.append("profile")),
+        worker = Ns(
+            vllm_config=Ns(model_config=Ns(hbm_limit_gb=total, hbm_reserved_gb=2, stage_id=0)),
+            cache_config=Ns(kv_cache_memory_bytes=explicit),
+            model_runner=Ns(model_memory_usage=10 * G, profile_run=lambda: calls.append("profile")),
             init_snapshot=object(), requested_memory=24 * G, rank=0, local_rank=0,
         )
         with patch.dict(sys.modules, {"vllm_omni.config.static_budget": budget}):
